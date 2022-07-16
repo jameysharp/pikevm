@@ -1,0 +1,8 @@
+[package]
+name = "pikevm"
+version = "0.1.0"
+edition = "2021"
+repository = "https://github.com/jameysharp/pikevm/"
+license = "MIT"
+
+[dependencies]
