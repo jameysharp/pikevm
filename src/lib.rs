@@ -64,6 +64,7 @@ impl Regex {
         };
         let (last, init) = pats.split_last().unwrap();
 
+        let mut max_registers = 0;
         for (idx, pat) in init.iter().enumerate() {
             let split = result.placeholder();
             let l1 = result.loc();
@@ -71,10 +72,17 @@ impl Regex {
             result.push(Inst::Match(idx as _));
             let l2 = result.loc();
             result.patch(split, Inst::Split(l1, l2));
+
+            // Every regex in the set gets its own collection of threads during matching, and every
+            // thread has its own distinct registers, so different regexes can use the same
+            // register indexes without overwriting each other's capture groups.
+            max_registers = max_registers.max(result.registers);
+            result.registers = 0;
         }
 
         result.compile(last);
         result.push(Inst::Match(init.len() as _));
+        result.registers = max_registers.max(result.registers);
 
         dbg!(&result);
         result
@@ -394,25 +402,25 @@ mod test {
 
     #[test]
     fn overlap_combined() {
-        // report matches for both ^(abc)$ and ^(ab*c)$ on the same string
+        // report matches for both ^(abc)$ and ^a(b*)c$ on the same string
         let r0 = Regex::seq([Regex::byte(b'a'), Regex::byte(b'b'), Regex::byte(b'c')]).capture();
-        let r1 = Regex::seq([Regex::byte(b'a'), Regex::byte(b'b').star(), Regex::byte(b'c')]).capture();
+        let r1 = Regex::seq([Regex::byte(b'a'), Regex::byte(b'b').star().capture(), Regex::byte(b'c')]);
         let p = Regex::compile_set(&[r0, r1]);
 
         let matches = p.fullmatch(b"abc");
         assert_eq!(matches, HashMap::from([
-            (0, vec![0, 3, usize::MAX, usize::MAX]),
-            (1, vec![usize::MAX, usize::MAX, 0, 3]),
+            (0, vec![0, 3]),
+            (1, vec![1, 2]),
         ]));
 
         let matches = p.fullmatch(b"ac");
         assert_eq!(matches, HashMap::from([
-            (1, vec![usize::MAX, usize::MAX, 0, 2]),
+            (1, vec![1, 1]),
         ]));
 
         let matches = p.fullmatch(b"abbc");
         assert_eq!(matches, HashMap::from([
-            (1, vec![usize::MAX, usize::MAX, 0, 4]),
+            (1, vec![1, 3]),
         ]));
     }
 
