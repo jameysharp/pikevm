@@ -67,11 +67,11 @@ impl Regex {
         let mut max_registers = 0;
         for (idx, pat) in init.iter().enumerate() {
             let split = result.placeholder();
-            let l1 = result.loc();
             result.compile(pat);
             result.push(Inst::Match(idx as _));
-            let l2 = result.loc();
-            result.patch(split, Inst::Split(l1, l2));
+            let to = result.loc();
+            let prefer_next = true; // priority doesn't matter for different match indexes
+            result.patch(split, Inst::Split { prefer_next, to });
 
             // Every regex in the set gets its own collection of threads during matching, and every
             // thread has its own distinct registers, so different regexes can use the same
@@ -102,7 +102,7 @@ enum Inst {
     Match(u16),
     Save(u16),
     Jmp(u16),
-    Split(u16, u16),
+    Split { prefer_next: bool, to: u16 },
 }
 
 #[derive(Clone, Debug)]
@@ -149,47 +149,35 @@ impl Program {
             }
             Regex::Alt(pats) => {
                 let split = self.placeholder();
-                let l1 = self.loc();
+                let prefer_next = true; // prefer left-most successful alternative
                 self.compile(&pats.0);
                 let jmp = self.placeholder();
-                let l2 = self.loc();
+                let to = self.loc();
                 self.compile(&pats.1);
-                let l3 = self.loc();
-                self.patch(split, Inst::Split(l1, l2));
-                self.patch(jmp, Inst::Jmp(l3));
+                let after = self.loc();
+                self.patch(split, Inst::Split { prefer_next, to });
+                self.patch(jmp, Inst::Jmp(after));
             }
-            Regex::Opt(pat, greedy) => {
+            &Regex::Opt(ref pat, prefer_next) => {
                 let split = self.placeholder();
-                let l1 = self.loc();
                 self.compile(pat);
-                let l2 = self.loc();
-                if *greedy {
-                    self.patch(split, Inst::Split(l1, l2));
-                } else {
-                    self.patch(split, Inst::Split(l2, l1));
-                }
+                let to = self.loc();
+                self.patch(split, Inst::Split { prefer_next, to });
             }
-            Regex::Star(pat, greedy) => {
+            &Regex::Star(ref pat, prefer_next) => {
                 let split = self.placeholder();
-                let l2 = self.loc();
                 self.compile(pat);
                 self.push(Inst::Jmp(split));
-                let l3 = self.loc();
-                if *greedy {
-                    self.patch(split, Inst::Split(l2, l3));
-                } else {
-                    self.patch(split, Inst::Split(l3, l2));
-                }
+                let to = self.loc();
+                self.patch(split, Inst::Split { prefer_next, to });
             }
-            Regex::Plus(pat, greedy) => {
-                let l1 = self.loc();
+            &Regex::Plus(ref pat, greedy) => {
+                let to = self.loc();
                 self.compile(pat);
-                let l3 = self.loc() + 1;
-                if *greedy {
-                    self.push(Inst::Split(l1, l3));
-                } else {
-                    self.push(Inst::Split(l3, l1));
-                }
+                self.push(Inst::Split {
+                    prefer_next: !greedy,
+                    to,
+                });
             }
         }
     }
@@ -217,7 +205,7 @@ impl Program {
                         // We're trying to match the full input string, so discard any match which
                         // completes before the end.
                     }
-                    Inst::Save(_) | Inst::Jmp(_) | Inst::Split(_, _) => unreachable!(),
+                    Inst::Save(_) | Inst::Jmp(_) | Inst::Split { .. } => unreachable!(),
                 }
             }
         }
@@ -283,7 +271,12 @@ impl<'a> Threads<'a> {
                 self.add(idx, pc + 1, saved);
             }
             Inst::Jmp(to) => self.add(idx, to, saved),
-            Inst::Split(a, b) => {
+            Inst::Split { prefer_next, to } => {
+                let (a, b) = if prefer_next {
+                    (pc + 1, to)
+                } else {
+                    (to, pc + 1)
+                };
                 self.add(idx, a, saved.clone());
                 self.add(idx, b, saved);
             }
