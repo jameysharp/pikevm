@@ -1,4 +1,5 @@
-use std::collections::{HashMap, HashSet};
+use bitvec::vec::BitVec;
+use std::collections::HashMap;
 use std::rc::Rc;
 
 #[derive(Clone, Debug)]
@@ -233,7 +234,7 @@ struct Thread {
 
 struct Threads<'a> {
     program: &'a Program,
-    active: HashSet<u16>,
+    active: BitVec,
     list: Vec<Thread>,
 }
 
@@ -243,7 +244,7 @@ impl<'a> Threads<'a> {
         saved.resize(program.registers as usize, usize::MAX);
         let mut result = Threads {
             program,
-            active: HashSet::new(),
+            active: BitVec::repeat(false, program.buf.len()),
             list: Vec::new(),
         };
         result.add(0, 0, Rc::new(saved));
@@ -252,11 +253,11 @@ impl<'a> Threads<'a> {
 
     fn take(&mut self, buf: &mut Vec<Thread>) {
         std::mem::swap(&mut self.list, buf);
-        self.active.clear();
+        self.active.fill(false);
     }
 
     fn add(&mut self, idx: usize, pc: u16, mut saved: Rc<Vec<usize>>) {
-        if !self.active.insert(pc) {
+        if self.active.replace(pc as usize, true) {
             return;
         }
         // NFA epsilon closure: a thread can only stop on Range or Match instructions. For anything

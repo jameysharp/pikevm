@@ -6,3 +6,4 @@ repository = "https://github.com/jameysharp/pikevm/"
 license = "MIT"
 
 [dependencies]
+bitvec = { version = "1.0.1", default-features = false, features = ["alloc"] }
