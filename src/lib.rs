@@ -214,9 +214,12 @@ impl Program {
         max_threads = max_threads.max(threads.list.len());
         dbg!(max_threads, self.registers);
 
+        debug_assert!(current.is_empty());
+        drop(current);
+        let Threads { list: current, .. } = threads;
+
         let mut best = HashMap::new();
-        threads.take(&mut current);
-        for thread in current.drain(..) {
+        for thread in current {
             if let Inst::Match(idx) = self.buf[thread.pc as usize] {
                 best.entry(idx).or_insert_with(|| (*thread.saved).clone());
             }
