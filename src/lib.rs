@@ -291,7 +291,9 @@ mod test {
     #[test]
     fn optional_ab() {
         // (ab)?(ab)?(ab)?$ (not anchored at start)
-        let ab = Regex::seq([Regex::byte(b'a'), Regex::byte(b'b')]).capture().opt();
+        let ab = Regex::seq([Regex::byte(b'a'), Regex::byte(b'b')])
+            .capture()
+            .opt();
         let r = Regex::seq([Regex::any().star_nongreedy(), ab.clone(), ab.clone(), ab]);
         let input = b"abababab";
 
@@ -323,8 +325,10 @@ mod test {
                 Regex::byte(b'a'),
                 Regex::byte(b'b'),
                 Regex::byte(b'a').opt(),
-            ]).capture(),
-        ]).star();
+            ])
+            .capture(),
+        ])
+        .star();
         let input = b"aabaaaba";
 
         let matches = r.compile().fullmatch(input);
@@ -376,52 +380,79 @@ mod test {
         let input = b"aaa";
 
         let matches = r.compile().fullmatch(input);
-        assert_eq!(matches, HashMap::from([(0, vec![
-            0, 3,
-            0, 3,
-            3, 3,
-            3, 3,
-            usize::MAX, usize::MAX,
-            usize::MAX, usize::MAX,
-            usize::MAX, usize::MAX,
-            usize::MAX, usize::MAX,
-            usize::MAX, usize::MAX,
-            usize::MAX, usize::MAX,
-            usize::MAX, usize::MAX,
-            usize::MAX, usize::MAX,
-            usize::MAX, usize::MAX,
-        ])]));
+        assert_eq!(
+            matches,
+            HashMap::from([(
+                0,
+                vec![
+                    0,
+                    3,
+                    0,
+                    3,
+                    3,
+                    3,
+                    3,
+                    3,
+                    usize::MAX,
+                    usize::MAX,
+                    usize::MAX,
+                    usize::MAX,
+                    usize::MAX,
+                    usize::MAX,
+                    usize::MAX,
+                    usize::MAX,
+                    usize::MAX,
+                    usize::MAX,
+                    usize::MAX,
+                    usize::MAX,
+                    usize::MAX,
+                    usize::MAX,
+                    usize::MAX,
+                    usize::MAX,
+                    usize::MAX,
+                    usize::MAX,
+                ]
+            )])
+        );
     }
 
     #[test]
     fn overlap_combined() {
         // report matches for both ^(abc)$ and ^a(b*)c$ on the same string
         let r0 = Regex::seq([Regex::byte(b'a'), Regex::byte(b'b'), Regex::byte(b'c')]).capture();
-        let r1 = Regex::seq([Regex::byte(b'a'), Regex::byte(b'b').star().capture(), Regex::byte(b'c')]);
+        let r1 = Regex::seq([
+            Regex::byte(b'a'),
+            Regex::byte(b'b').star().capture(),
+            Regex::byte(b'c'),
+        ]);
         let p = Regex::compile_set(&[r0, r1]);
 
         let matches = p.fullmatch(b"abc");
-        assert_eq!(matches, HashMap::from([
-            (0, vec![0, 3]),
-            (1, vec![1, 2]),
-        ]));
+        assert_eq!(matches, HashMap::from([(0, vec![0, 3]), (1, vec![1, 2]),]));
 
         let matches = p.fullmatch(b"ac");
-        assert_eq!(matches, HashMap::from([
-            (1, vec![1, 1]),
-        ]));
+        assert_eq!(matches, HashMap::from([(1, vec![1, 1]),]));
 
         let matches = p.fullmatch(b"abbc");
-        assert_eq!(matches, HashMap::from([
-            (1, vec![1, 3]),
-        ]));
+        assert_eq!(matches, HashMap::from([(1, vec![1, 3]),]));
     }
 
     #[test]
     fn pathological() {
         // ^a*a*a*a*a*a*a*a*a*b$
         let a = Regex::star(Regex::byte(b'a'));
-        let r = Regex::seq([a.clone(), a.clone(), a.clone(), a.clone(), a.clone(), a.clone(), a.clone(), a.clone(), a, Regex::byte(b'b')]);
+        let r = Regex::seq([
+            a.clone(),
+            a.clone(),
+            a.clone(),
+            a.clone(),
+            a.clone(),
+            a.clone(),
+            a.clone(),
+            a.clone(),
+            a,
+            Regex::byte(b'b'),
+        ]);
         let input = b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaabc";
 
         assert_eq!(r.compile().fullmatch(input), HashMap::new());
