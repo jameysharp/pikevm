@@ -6,18 +6,20 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 pub fn compile(pat: &str) -> regex_syntax::Result<Program> {
-    compile_set(&[pat])
+    compile_set([pat])
 }
 
-pub fn compile_set(pats: &[&str]) -> regex_syntax::Result<Program> {
+pub fn compile_set<S: AsRef<str>>(
+    pats: impl IntoIterator<Item = S>,
+) -> regex_syntax::Result<Program> {
     let mut result = Program {
         buf: Vec::new(),
         registers: 0,
     };
 
     let hirs = pats
-        .iter()
-        .map(|pat| Parser::new().parse(pat))
+        .into_iter()
+        .map(|pat| Parser::new().parse(pat.as_ref()))
         .collect::<regex_syntax::Result<Vec<Hir>>>()?;
 
     result.alts(hirs.into_iter().enumerate().map(|(idx, hir)| {
