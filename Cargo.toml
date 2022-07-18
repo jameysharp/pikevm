@@ -7,3 +7,4 @@ license = "MIT"
 
 [dependencies]
 bitvec = { version = "1.0.1", default-features = false, features = ["alloc"] }
+regex-syntax = "0.6.27"

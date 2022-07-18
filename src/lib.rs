@@ -1,98 +1,42 @@
 use bitvec::vec::BitVec;
+use regex_syntax::hir::{self, Hir, HirKind};
+use regex_syntax::utf8::Utf8Sequences;
+use regex_syntax::Parser;
 use std::collections::HashMap;
 use std::rc::Rc;
 
-#[derive(Clone, Debug)]
-pub enum Regex {
-    Range(u8, u8),
-    Capture(Box<Regex>),
-    Seq(Vec<Regex>),
-    Alt(Vec<Regex>),
-    Opt(Box<Regex>, bool),
-    Star(Box<Regex>, bool),
-    Plus(Box<Regex>, bool),
+pub fn compile(pat: &str) -> regex_syntax::Result<Program> {
+    compile_set(&[pat])
 }
 
-impl Regex {
-    pub fn any() -> Regex {
-        Regex::Range(0, 255)
-    }
+pub fn compile_set(pats: &[&str]) -> regex_syntax::Result<Program> {
+    let mut result = Program {
+        buf: Vec::new(),
+        registers: 0,
+    };
 
-    pub fn byte(b: u8) -> Regex {
-        Regex::Range(b, b)
-    }
+    let hirs = pats
+        .iter()
+        .map(|pat| Parser::new().parse(pat))
+        .collect::<regex_syntax::Result<Vec<Hir>>>()?;
 
-    pub fn capture(self) -> Regex {
-        Regex::Capture(Box::new(self))
-    }
+    result.alts(hirs.into_iter().enumerate().map(|(idx, hir)| {
+        move |p: &mut Program| {
+            // Every regex in the set gets its own collection of threads during matching, and
+            // every thread has its own distinct registers, so different regexes can use the
+            // same register indexes without overwriting each other's capture groups.
+            let registers = p.registers;
+            p.registers = 0;
 
-    pub fn seq(pats: impl IntoIterator<Item = Regex>) -> Regex {
-        Regex::Seq(pats.into_iter().collect())
-    }
+            p.compile_hir(&hir);
+            p.push(Inst::Match(idx as _));
 
-    pub fn alternation(pats: Vec<Regex>) -> Regex {
-        Regex::Alt(pats)
-    }
+            p.registers = registers.max(p.registers);
+        }
+    }));
 
-    pub fn opt(self) -> Regex {
-        Regex::Opt(Box::new(self), true)
-    }
-
-    pub fn opt_nongreedy(self) -> Regex {
-        Regex::Opt(Box::new(self), false)
-    }
-
-    pub fn star(self) -> Regex {
-        Regex::Star(Box::new(self), true)
-    }
-
-    pub fn star_nongreedy(self) -> Regex {
-        Regex::Star(Box::new(self), false)
-    }
-
-    pub fn plus(self) -> Regex {
-        Regex::Plus(Box::new(self), true)
-    }
-
-    pub fn plus_nongreedy(self) -> Regex {
-        Regex::Plus(Box::new(self), false)
-    }
-
-    pub fn compile(self) -> Program {
-        Regex::compile_set(&[self])
-    }
-
-    pub fn compile_set(pats: &[Regex]) -> Program {
-        let mut result = Program {
-            buf: Vec::new(),
-            registers: 0,
-        };
-
-        result.alts(pats.iter().enumerate().map(|(idx, pat)| {
-            move |p: &mut Program| {
-                // Every regex in the set gets its own collection of threads during matching, and
-                // every thread has its own distinct registers, so different regexes can use the
-                // same register indexes without overwriting each other's capture groups.
-                let registers = p.registers;
-                p.registers = 0;
-
-                p.compile(pat);
-                p.push(Inst::Match(idx as _));
-
-                p.registers = registers.max(p.registers);
-            }
-        }));
-
-        dbg!(&result);
-        result
-    }
-}
-
-impl std::ops::BitOr for Regex {
-    type Output = Self;
-    fn bitor(self, rhs: Self) -> Self {
-        Regex::Alt(vec![self, rhs])
-    }
+    dbg!(&result);
+    Ok(result)
 }
 
 #[derive(Clone, Debug)]
@@ -149,46 +93,89 @@ impl Program {
         }
     }
 
-    fn compile(&mut self, pat: &Regex) {
-        match pat {
-            &Regex::Range(lo, hi) => {
-                self.push(Inst::Range(lo, hi));
-            }
-            Regex::Capture(pat) => {
-                let register = self.registers;
-                self.registers += 2;
-                self.push(Inst::Save(register));
-                self.compile(pat);
-                self.push(Inst::Save(register + 1));
-            }
-            Regex::Seq(pats) => {
-                for pat in pats {
-                    self.compile(pat);
+    fn compile_hir(&mut self, hir: &Hir) {
+        match hir.kind() {
+            HirKind::Empty => {}
+            HirKind::Literal(hir::Literal::Unicode(u)) => {
+                let mut buf = [0; 4];
+                for b in u.encode_utf8(&mut buf).bytes() {
+                    self.push(Inst::Range(b, b));
                 }
             }
-            Regex::Alt(pats) => {
-                self.alts(pats.iter().map(|pat| |p: &mut Program| p.compile(pat)));
+            &HirKind::Literal(hir::Literal::Byte(b)) => {
+                self.push(Inst::Range(b, b));
             }
-            &Regex::Opt(ref pat, prefer_next) => {
-                let split = self.placeholder();
-                self.compile(pat);
-                let to = self.loc();
-                self.patch(split, Inst::Split { prefer_next, to });
+            HirKind::Class(hir::Class::Unicode(uc)) => {
+                self.alts(
+                    uc.iter()
+                        .flat_map(|range| Utf8Sequences::new(range.start(), range.end()))
+                        .map(|seq| {
+                            move |p: &mut Program| {
+                                for byte_range in seq.as_slice() {
+                                    p.push(Inst::Range(byte_range.start, byte_range.end));
+                                }
+                            }
+                        }),
+                );
             }
-            &Regex::Star(ref pat, prefer_next) => {
-                let split = self.placeholder();
-                self.compile(pat);
-                self.push(Inst::Jmp(split));
-                let to = self.loc();
-                self.patch(split, Inst::Split { prefer_next, to });
+            HirKind::Class(hir::Class::Bytes(bc)) => {
+                self.alts(bc.iter().map(|range| {
+                    move |p: &mut Program| {
+                        p.push(Inst::Range(range.start(), range.end()));
+                    }
+                }));
             }
-            &Regex::Plus(ref pat, greedy) => {
-                let to = self.loc();
-                self.compile(pat);
-                self.push(Inst::Split {
-                    prefer_next: !greedy,
-                    to,
-                });
+            HirKind::Anchor(_) => unimplemented!(),
+            HirKind::WordBoundary(_) => unimplemented!(),
+            HirKind::Repetition(rep) => match rep.kind {
+                hir::RepetitionKind::ZeroOrOne => {
+                    let split = self.placeholder();
+                    self.compile_hir(&*rep.hir);
+                    let to = self.loc();
+                    let prefer_next = rep.greedy;
+                    self.patch(split, Inst::Split { prefer_next, to });
+                }
+                hir::RepetitionKind::ZeroOrMore => {
+                    let split = self.placeholder();
+                    self.compile_hir(&*rep.hir);
+                    self.push(Inst::Jmp(split));
+                    let to = self.loc();
+                    let prefer_next = rep.greedy;
+                    self.patch(split, Inst::Split { prefer_next, to });
+                }
+                hir::RepetitionKind::OneOrMore => {
+                    let to = self.loc();
+                    self.compile_hir(&*rep.hir);
+                    let prefer_next = !rep.greedy;
+                    self.push(Inst::Split { prefer_next, to });
+                }
+                hir::RepetitionKind::Range(_) => unimplemented!(),
+            },
+            HirKind::Group(group) => {
+                match group.kind {
+                    hir::GroupKind::CaptureIndex(index)
+                    | hir::GroupKind::CaptureName { index, .. } => {
+                        let register = ((index - 1) * 2) as _;
+                        self.registers = register + 2;
+                        self.push(Inst::Save(register));
+                        self.compile_hir(&*group.hir);
+                        self.push(Inst::Save(register + 1));
+                    }
+                    hir::GroupKind::NonCapturing => {
+                        self.compile_hir(&*group.hir);
+                    }
+                };
+            }
+            HirKind::Concat(subs) => {
+                for hir in subs {
+                    self.compile_hir(hir);
+                }
+            }
+            HirKind::Alternation(subs) => {
+                self.alts(
+                    subs.iter()
+                        .map(|hir| move |p: &mut Program| p.compile_hir(hir)),
+                );
             }
         }
     }
@@ -305,53 +292,36 @@ mod test {
     #[test]
     fn optional_ab() {
         // (ab)?(ab)?(ab)?$ (not anchored at start)
-        let ab = Regex::seq([Regex::byte(b'a'), Regex::byte(b'b')])
-            .capture()
-            .opt();
-        let r = Regex::seq([Regex::any().star_nongreedy(), ab.clone(), ab.clone(), ab]);
+        let p = compile(".*?(ab)?(ab)?(ab)?").unwrap();
         let input = b"abababab";
 
-        let matches = r.compile().fullmatch(input);
+        let matches = p.fullmatch(input);
         assert_eq!(matches, HashMap::from([(0, vec![2, 4, 4, 6, 6, 8])]));
     }
 
     #[test]
     fn unanchored_prefix() {
         // (a*)b?c?$ (not anchored at start)
-        let r = Regex::seq([
-            Regex::any().star_nongreedy(),
-            Regex::byte(b'a').star().capture(),
-            Regex::byte(b'b').opt(),
-            Regex::byte(b'c').opt(),
-        ]);
+        let p = compile(".*?(a*)b?c?").unwrap();
         let input = b"abacba";
 
-        let matches = r.compile().fullmatch(input);
+        let matches = p.fullmatch(input);
         assert_eq!(matches, HashMap::from([(0, vec![5, 6])]));
     }
 
     #[test]
     fn a_plus_aba() {
         // ^(?:(a+)(aba?))*$
-        let r = Regex::seq([
-            Regex::byte(b'a').plus().capture(),
-            Regex::seq([
-                Regex::byte(b'a'),
-                Regex::byte(b'b'),
-                Regex::byte(b'a').opt(),
-            ])
-            .capture(),
-        ])
-        .star();
+        let p = compile("(?:(a+)(aba?))*").unwrap();
         let input = b"aabaaaba";
 
-        let matches = r.compile().fullmatch(input);
+        let matches = p.fullmatch(input);
         assert_eq!(matches, HashMap::from([(0, vec![4, 5, 5, 8])]));
     }
 
     #[test]
     fn star_star() {
-        let p = Regex::byte(b'a').star().star().compile();
+        let p = compile("a**").unwrap();
 
         assert_eq!(p.fullmatch(b""), HashMap::from([(0, vec![])]));
 
@@ -363,37 +333,30 @@ mod test {
     #[test]
     fn nested_captures() {
         // ^((a)b)$
-        let r = Regex::seq([Regex::byte(b'a').capture(), Regex::byte(b'b')]).capture();
+        let p = compile("((a)b)").unwrap();
         let input = b"ab";
 
-        let matches = r.compile().fullmatch(input);
+        let matches = p.fullmatch(input);
         assert_eq!(matches, HashMap::from([(0, vec![0, 2, 0, 1])]));
     }
 
     #[test]
     fn leftmost_greedy() {
         // ^(?:(a*)(a*)(a*))*(b+)$
-        let a_star = Regex::byte(b'a').star().capture();
-        let r = Regex::seq([
-            Regex::seq([a_star.clone(), a_star.clone(), a_star]).star(),
-            Regex::byte(b'b').plus().capture(),
-        ]);
+        let p = compile("(?:(a*)(a*)(a*))*(b+)").unwrap();
         let input = b"aabb";
 
-        let matches = r.compile().fullmatch(input);
+        let matches = p.fullmatch(input);
         assert_eq!(matches, HashMap::from([(0, vec![0, 2, 2, 2, 2, 2, 2, 4])]));
     }
 
     #[test]
     fn many_empty() {
         // ^((a*)(a*)(a*)|(a*)(a*)(a*)|(a*)(a*)(a*)|(a*)(a*)(a*))*$
-        let a_star = Regex::byte(b'a').star().capture();
-        let triple = Regex::seq([a_star.clone(), a_star.clone(), a_star]);
-        let alts = triple.clone() | triple.clone() | triple.clone() | triple;
-        let r = alts.capture().star();
+        let p = compile("((a*)(a*)(a*)|(a*)(a*)(a*)|(a*)(a*)(a*)|(a*)(a*)(a*))*").unwrap();
         let input = b"aaa";
 
-        let matches = r.compile().fullmatch(input);
+        let matches = p.fullmatch(input);
         assert_eq!(
             matches,
             HashMap::from([(
@@ -433,13 +396,7 @@ mod test {
     #[test]
     fn overlap_combined() {
         // report matches for both ^(abc)$ and ^a(b*)c$ on the same string
-        let r0 = Regex::seq([Regex::byte(b'a'), Regex::byte(b'b'), Regex::byte(b'c')]).capture();
-        let r1 = Regex::seq([
-            Regex::byte(b'a'),
-            Regex::byte(b'b').star().capture(),
-            Regex::byte(b'c'),
-        ]);
-        let p = Regex::compile_set(&[r0, r1]);
+        let p = compile_set(&["(abc)", "a(b*)c"]).unwrap();
 
         let matches = p.fullmatch(b"abc");
         assert_eq!(matches, HashMap::from([(0, vec![0, 3]), (1, vec![1, 2]),]));
@@ -454,21 +411,9 @@ mod test {
     #[test]
     fn pathological() {
         // ^a*a*a*a*a*a*a*a*a*b$
-        let a = Regex::star(Regex::byte(b'a'));
-        let r = Regex::seq([
-            a.clone(),
-            a.clone(),
-            a.clone(),
-            a.clone(),
-            a.clone(),
-            a.clone(),
-            a.clone(),
-            a.clone(),
-            a,
-            Regex::byte(b'b'),
-        ]);
+        let p = compile("a*a*a*a*a*a*a*a*a*b").unwrap();
         let input = b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaabc";
 
-        assert_eq!(r.compile().fullmatch(input), HashMap::new());
+        assert_eq!(p.fullmatch(input), HashMap::new());
     }
 }

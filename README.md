@@ -10,8 +10,7 @@ This repo contains a Rust implementation of the section of that post
 titled "Pike's Implementation", together with the enhancements from the
 section titled "Ambiguous Submatching". This implementation is not
 intended for production use, but rather to aid in understanding the blog
-post. Among other issues, I haven't bothered parsing any regex syntax; I
-construct an AST directly instead.
+post.
 
 The code is largely uncommented; see Cox's blog posts for most of the
 explanation of what's going on. That said, there are some details that
@@ -19,7 +18,7 @@ Cox largely handwaved which I've made explicit in this implementation,
 so I hope reading the code might also help in understanding the blog
 post.
 
-The implementation is pretty simple: Compiling a regex is around 130
+The implementation is pretty simple: Compiling a regex is around 170
 lines of code, and matching is about 100 lines. I've put no real effort
 into performance, just aiming for a (hopefully) readable implementation.
 
