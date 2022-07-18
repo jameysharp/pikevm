@@ -7,7 +7,7 @@ pub enum Regex {
     Range(u8, u8),
     Capture(Box<Regex>),
     Seq(Vec<Regex>),
-    Alt(Box<(Regex, Regex)>),
+    Alt(Vec<Regex>),
     Opt(Box<Regex>, bool),
     Star(Box<Regex>, bool),
     Plus(Box<Regex>, bool),
@@ -28,6 +28,10 @@ impl Regex {
 
     pub fn seq(pats: impl IntoIterator<Item = Regex>) -> Regex {
         Regex::Seq(pats.into_iter().collect())
+    }
+
+    pub fn alternation(pats: Vec<Regex>) -> Regex {
+        Regex::Alt(pats)
     }
 
     pub fn opt(self) -> Regex {
@@ -63,27 +67,21 @@ impl Regex {
             buf: Vec::new(),
             registers: 0,
         };
-        let (last, init) = pats.split_last().unwrap();
 
-        let mut max_registers = 0;
-        for (idx, pat) in init.iter().enumerate() {
-            let split = result.placeholder();
-            result.compile(pat);
-            result.push(Inst::Match(idx as _));
-            let to = result.loc();
-            let prefer_next = true; // priority doesn't matter for different match indexes
-            result.patch(split, Inst::Split { prefer_next, to });
+        result.alts(pats.iter().enumerate().map(|(idx, pat)| {
+            move |p: &mut Program| {
+                // Every regex in the set gets its own collection of threads during matching, and
+                // every thread has its own distinct registers, so different regexes can use the
+                // same register indexes without overwriting each other's capture groups.
+                let registers = p.registers;
+                p.registers = 0;
 
-            // Every regex in the set gets its own collection of threads during matching, and every
-            // thread has its own distinct registers, so different regexes can use the same
-            // register indexes without overwriting each other's capture groups.
-            max_registers = max_registers.max(result.registers);
-            result.registers = 0;
-        }
+                p.compile(pat);
+                p.push(Inst::Match(idx as _));
 
-        result.compile(last);
-        result.push(Inst::Match(init.len() as _));
-        result.registers = max_registers.max(result.registers);
+                p.registers = registers.max(p.registers);
+            }
+        }));
 
         dbg!(&result);
         result
@@ -93,7 +91,7 @@ impl Regex {
 impl std::ops::BitOr for Regex {
     type Output = Self;
     fn bitor(self, rhs: Self) -> Self {
-        Regex::Alt(Box::new((self, rhs)))
+        Regex::Alt(vec![self, rhs])
     }
 }
 
@@ -131,6 +129,26 @@ impl Program {
         self.buf[loc as usize] = inst;
     }
 
+    fn alts<F: FnOnce(&mut Self)>(&mut self, alts: impl IntoIterator<Item = F>) {
+        let prefer_next = true; // prefer left-most successful alternative
+        let mut iter = alts.into_iter();
+        let mut last = iter.next().unwrap();
+        let mut jmps = Vec::new();
+        for next in iter {
+            let split = self.placeholder();
+            last(self);
+            jmps.push(self.placeholder());
+            let to = self.loc();
+            self.patch(split, Inst::Split { prefer_next, to });
+            last = next;
+        }
+        last(self);
+        let to = self.loc();
+        for jmp in jmps {
+            self.patch(jmp, Inst::Jmp(to));
+        }
+    }
+
     fn compile(&mut self, pat: &Regex) {
         match pat {
             &Regex::Range(lo, hi) => {
@@ -149,15 +167,7 @@ impl Program {
                 }
             }
             Regex::Alt(pats) => {
-                let split = self.placeholder();
-                let prefer_next = true; // prefer left-most successful alternative
-                self.compile(&pats.0);
-                let jmp = self.placeholder();
-                let to = self.loc();
-                self.compile(&pats.1);
-                let after = self.loc();
-                self.patch(split, Inst::Split { prefer_next, to });
-                self.patch(jmp, Inst::Jmp(after));
+                self.alts(pats.iter().map(|pat| |p: &mut Program| p.compile(pat)));
             }
             &Regex::Opt(ref pat, prefer_next) => {
                 let split = self.placeholder();
