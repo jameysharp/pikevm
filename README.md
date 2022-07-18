@@ -25,13 +25,7 @@ into performance, just aiming for a (hopefully) readable implementation.
 Like the blog post, this version supports capture groups with both
 greedy and non-greedy repetition operators. I've also extended the
 original algorithm to match a set of regexes against a single input all
-at once.
-
-This implementation only supports patterns which are anchored at both
-ends, but you can insert `.*?` at the beginning or end of the pattern to
-get unanchored matches. Similarly, the conventional capture group `$0`
-isn't provided automatically; wrap the entire pattern in a capture if
-you want it.
+at once, and to handle anchors and word-boundary assertions.
 
 For a given regex, this algorithm uses O(1) space, and O(n) time in the
 length of the input; asymptotically it should be identical to a DFA

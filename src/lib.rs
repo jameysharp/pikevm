@@ -15,7 +15,7 @@ pub fn compile_set<S: AsRef<str>>(
 ) -> regex_syntax::Result<Program> {
     let mut result = Program {
         buf: Vec::new(),
-        registers: 0,
+        registers: 2,
     };
 
     let hirs = pats
@@ -39,7 +39,9 @@ pub fn compile_set<S: AsRef<str>>(
                 }));
             }
 
+            p.push(Inst::Save(0));
             p.compile_hir(&hir);
+            p.push(Inst::Save(1));
             p.push(Inst::Match(idx as _));
 
             p.registers = registers.max(p.registers);
@@ -191,7 +193,7 @@ impl Program {
                 match group.kind {
                     hir::GroupKind::CaptureIndex(index)
                     | hir::GroupKind::CaptureName { index, .. } => {
-                        let register = ((index - 1) * 2) as _;
+                        let register = (index * 2) as _;
                         self.registers = register + 2;
                         self.push(Inst::Save(register));
                         self.compile_hir(&*group.hir);
@@ -398,7 +400,7 @@ mod test {
         let input = b"abababab";
 
         let matches = p.exec(input);
-        assert_eq!(matches, HashMap::from([(0, vec![2, 4, 4, 6, 6, 8])]));
+        assert_eq!(matches, HashMap::from([(0, vec![2, 8, 2, 4, 4, 6, 6, 8])]));
     }
 
     #[test]
@@ -407,7 +409,7 @@ mod test {
         let input = b"abacba";
 
         let matches = p.exec(input);
-        assert_eq!(matches, HashMap::from([(0, vec![5, 6])]));
+        assert_eq!(matches, HashMap::from([(0, vec![5, 6, 5, 6])]));
     }
 
     #[test]
@@ -416,18 +418,15 @@ mod test {
         let input = b"aabaaaba";
 
         let matches = p.exec(input);
-        assert_eq!(matches, HashMap::from([(0, vec![4, 5, 5, 8])]));
+        assert_eq!(matches, HashMap::from([(0, vec![0, 8, 4, 5, 5, 8])]));
     }
 
     #[test]
     fn star_star() {
-        let p = compile("^a**$").unwrap();
-
-        assert_eq!(p.exec(b""), HashMap::from([(0, vec![])]));
-
-        assert_eq!(p.exec(b"a"), HashMap::from([(0, vec![])]));
-
-        assert_eq!(p.exec(b"aa"), HashMap::from([(0, vec![])]));
+        let p = compile("a**").unwrap();
+        assert_eq!(p.exec(b""), HashMap::from([(0, vec![0, 0])]));
+        assert_eq!(p.exec(b"a"), HashMap::from([(0, vec![0, 1])]));
+        assert_eq!(p.exec(b"aa"), HashMap::from([(0, vec![0, 2])]));
     }
 
     #[test]
@@ -436,7 +435,7 @@ mod test {
         let input = b"ab";
 
         let matches = p.exec(input);
-        assert_eq!(matches, HashMap::from([(0, vec![0, 2, 0, 1])]));
+        assert_eq!(matches, HashMap::from([(0, vec![0, 2, 0, 2, 0, 1])]));
     }
 
     #[test]
@@ -445,7 +444,10 @@ mod test {
         let input = b"aabb";
 
         let matches = p.exec(input);
-        assert_eq!(matches, HashMap::from([(0, vec![0, 2, 2, 2, 2, 2, 2, 4])]));
+        assert_eq!(
+            matches,
+            HashMap::from([(0, vec![0, 4, 0, 2, 2, 2, 2, 2, 2, 4])])
+        );
     }
 
     #[test]
@@ -459,6 +461,8 @@ mod test {
             HashMap::from([(
                 0,
                 vec![
+                    0,
+                    3,
                     0,
                     3,
                     0,
@@ -496,13 +500,16 @@ mod test {
         let p = compile_set(&["^(abc)$", "^a(b*)c$"]).unwrap();
 
         let matches = p.exec(b"abc");
-        assert_eq!(matches, HashMap::from([(0, vec![0, 3]), (1, vec![1, 2]),]));
+        assert_eq!(
+            matches,
+            HashMap::from([(0, vec![0, 3, 0, 3]), (1, vec![0, 3, 1, 2]),])
+        );
 
         let matches = p.exec(b"ac");
-        assert_eq!(matches, HashMap::from([(1, vec![1, 1]),]));
+        assert_eq!(matches, HashMap::from([(1, vec![0, 2, 1, 1]),]));
 
         let matches = p.exec(b"abbc");
-        assert_eq!(matches, HashMap::from([(1, vec![1, 3]),]));
+        assert_eq!(matches, HashMap::from([(1, vec![0, 4, 1, 3]),]));
     }
 
     #[test]

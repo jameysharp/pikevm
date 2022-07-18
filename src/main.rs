@@ -9,7 +9,7 @@ fn main() -> regex_syntax::Result<()> {
             patterns[idx as usize], input
         );
         for (idx, group) in captures.chunks_exact(2).enumerate() {
-            print!(" -- {}: ", idx + 1);
+            print!(" -- {}: ", idx);
             let start = group[0];
             let end = group[1];
             if start == usize::MAX {
