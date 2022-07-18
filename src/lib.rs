@@ -3,6 +3,7 @@ use flagset::{flags, FlagSet};
 use regex_syntax::hir::{self, Hir, HirKind};
 use regex_syntax::utf8::Utf8Sequences;
 use regex_syntax::{is_word_byte, Parser};
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -222,8 +223,19 @@ impl Program {
         let mut threads = Threads::new(self);
         let mut current = Vec::new();
         let mut max_threads = threads.list.len();
-        let mut best_overall = HashMap::new();
-        let mut best_now = HashMap::new();
+        let mut best = HashMap::new();
+
+        let mut save_match = |match_idx, captures: Rc<Vec<usize>>| match best.entry(match_idx) {
+            Entry::Vacant(e) => {
+                e.insert(captures);
+            }
+            Entry::Occupied(e) => {
+                let previous = e.into_mut();
+                if previous[0] == captures[0] && previous[1] < captures[1] {
+                    *previous = captures;
+                }
+            }
+        };
 
         let mut last_sp = None;
         for (idx, sp) in input.iter().copied().enumerate() {
@@ -248,16 +260,13 @@ impl Program {
                             threads.add(idx + 1, thread.next());
                         }
                     }
-                    Inst::Match(match_idx) => {
-                        best_now.entry(match_idx).or_insert(thread.saved);
-                    }
+                    Inst::Match(match_idx) => save_match(match_idx, thread.saved),
                     Inst::Assertion(_) | Inst::Save(_) | Inst::Jmp(_) | Inst::Split { .. } => {
                         unreachable!()
                     }
                 }
             }
 
-            best_overall.extend(best_now.drain());
             last_sp = Some(sp);
         }
 
@@ -270,13 +279,11 @@ impl Program {
         for mut thread in current {
             if let Inst::Match(match_idx) = self.buf[thread.pc as usize] {
                 if thread.check_assertions(last_sp, None) {
-                    best_now.entry(match_idx).or_insert(thread.saved);
+                    save_match(match_idx, thread.saved);
                 }
             }
         }
-        best_overall.extend(best_now);
-        best_overall
-            .into_iter()
+        best.into_iter()
             .map(|(match_idx, saved)| (match_idx, (*saved).clone()))
             .collect()
     }
