@@ -9,15 +9,14 @@ fn main() -> regex_syntax::Result<()> {
             patterns[idx as usize], input
         );
         for (idx, group) in captures.chunks_exact(2).enumerate() {
+            print!(" -- {}: ", idx + 1);
             let start = group[0];
             let end = group[1];
-            println!(
-                " -- {}: \"{}\" ({},{})",
-                idx + 1,
-                &input[start..end],
-                start,
-                end
-            );
+            if start == usize::MAX {
+                println!("no match");
+            } else {
+                println!("\"{}\" ({},{})", &input[start..end], start, end);
+            }
         }
     }
     Ok(())
