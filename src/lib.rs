@@ -1,7 +1,8 @@
 use bitvec::vec::BitVec;
+use flagset::{flags, FlagSet};
 use regex_syntax::hir::{self, Hir, HirKind};
 use regex_syntax::utf8::Utf8Sequences;
-use regex_syntax::Parser;
+use regex_syntax::{is_word_byte, Parser};
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -30,6 +31,14 @@ pub fn compile_set<S: AsRef<str>>(
             let registers = p.registers;
             p.registers = 0;
 
+            if !hir.is_anchored_start() {
+                p.compile_hir(&Hir::repetition(hir::Repetition {
+                    kind: hir::RepetitionKind::ZeroOrMore,
+                    greedy: false,
+                    hir: Box::new(Hir::any(true)),
+                }));
+            }
+
             p.compile_hir(&hir);
             p.push(Inst::Match(idx as _));
 
@@ -41,9 +50,21 @@ pub fn compile_set<S: AsRef<str>>(
     Ok(result)
 }
 
+flags! {
+    enum Assertions: u8 {
+        StartLine,
+        EndLine,
+        StartText,
+        EndText,
+        AsciiWordBoundary,
+        AsciiNotWordBoundary,
+    }
+}
+
 #[derive(Clone, Debug)]
 enum Inst {
     Range(u8, u8),
+    Assertion(Assertions),
     Match(u16),
     Save(u16),
     Jmp(u16),
@@ -127,8 +148,21 @@ impl Program {
                     }
                 }));
             }
-            HirKind::Anchor(_) => unimplemented!(),
-            HirKind::WordBoundary(_) => unimplemented!(),
+            HirKind::Anchor(kind) => {
+                self.push(Inst::Assertion(match kind {
+                    hir::Anchor::StartLine => Assertions::StartLine,
+                    hir::Anchor::EndLine => Assertions::EndLine,
+                    hir::Anchor::StartText => Assertions::StartText,
+                    hir::Anchor::EndText => Assertions::EndText,
+                }));
+            }
+            HirKind::WordBoundary(kind) => {
+                self.push(Inst::Assertion(match kind {
+                    hir::WordBoundary::Ascii => Assertions::AsciiWordBoundary,
+                    hir::WordBoundary::AsciiNegate => Assertions::AsciiNotWordBoundary,
+                    _ => unimplemented!(),
+                }));
+            }
             HirKind::Repetition(rep) => match rep.kind {
                 hir::RepetitionKind::ZeroOrOne => {
                     let split = self.placeholder();
@@ -182,49 +216,67 @@ impl Program {
         }
     }
 
-    pub fn fullmatch(&self, input: &[u8]) -> HashMap<u16, Vec<usize>> {
+    pub fn exec(&self, input: &[u8]) -> HashMap<u16, Vec<usize>> {
         let mut threads = Threads::new(self);
         let mut current = Vec::new();
-        let mut max_threads = 0;
+        let mut max_threads = threads.list.len();
+        let mut best_overall = HashMap::new();
+        let mut best_now = HashMap::new();
 
-        for (idx, sp) in input.iter().enumerate() {
-            dbg!(idx, *sp, &threads.list);
-            max_threads = max_threads.max(threads.list.len());
-
+        let mut last_sp = None;
+        for (idx, sp) in input.iter().copied().enumerate() {
             threads.take(&mut current);
+            if current.is_empty() {
+                break;
+            }
 
-            for thread in current.drain(..) {
+            dbg!(idx, sp, &current);
+            max_threads = max_threads.max(current.len());
+
+            for mut thread in current.drain(..) {
                 dbg!(thread.pc, &self.buf[thread.pc as usize]);
+
+                if !thread.check_assertions(last_sp, Some(sp)) {
+                    continue;
+                }
+
                 match self.buf[thread.pc as usize] {
                     Inst::Range(lo, hi) => {
-                        if *sp >= lo && *sp <= hi {
-                            threads.add(idx + 1, thread.pc + 1, thread.saved);
+                        if sp >= lo && sp <= hi {
+                            threads.add(idx + 1, thread.next());
                         }
                     }
-                    Inst::Match(_) => {
-                        // We're trying to match the full input string, so discard any match which
-                        // completes before the end.
+                    Inst::Match(match_idx) => {
+                        best_now.entry(match_idx).or_insert(thread.saved);
                     }
-                    Inst::Save(_) | Inst::Jmp(_) | Inst::Split { .. } => unreachable!(),
+                    Inst::Assertion(_) | Inst::Save(_) | Inst::Jmp(_) | Inst::Split { .. } => {
+                        unreachable!()
+                    }
                 }
             }
+
+            best_overall.extend(best_now.drain());
+            last_sp = Some(sp);
         }
 
-        max_threads = max_threads.max(threads.list.len());
         dbg!(max_threads, self.registers);
 
         debug_assert!(current.is_empty());
         drop(current);
         let Threads { list: current, .. } = threads;
 
-        let mut best = HashMap::new();
-        for thread in current {
-            if let Inst::Match(idx) = self.buf[thread.pc as usize] {
-                best.entry(idx).or_insert_with(|| (*thread.saved).clone());
+        for mut thread in current {
+            if let Inst::Match(match_idx) = self.buf[thread.pc as usize] {
+                if thread.check_assertions(last_sp, None) {
+                    best_now.entry(match_idx).or_insert(thread.saved);
+                }
             }
         }
-
-        best
+        best_overall.extend(best_now);
+        best_overall
+            .into_iter()
+            .map(|(match_idx, saved)| (match_idx, (*saved).clone()))
+            .collect()
     }
 }
 
@@ -232,6 +284,43 @@ impl Program {
 struct Thread {
     pc: u16,
     saved: Rc<Vec<usize>>,
+    assertions: FlagSet<Assertions>,
+}
+
+impl Thread {
+    fn new(pc: u16, saved: Rc<Vec<usize>>) -> Self {
+        Thread {
+            pc,
+            saved,
+            assertions: FlagSet::default(),
+        }
+    }
+
+    fn next(mut self) -> Self {
+        self.pc += 1;
+        self
+    }
+
+    fn check_assertions(&mut self, prev: Option<u8>, next: Option<u8>) -> bool {
+        for assertion in self.assertions.drain() {
+            let passed = match assertion {
+                Assertions::StartText => prev.is_none(),
+                Assertions::EndText => next.is_none(),
+                Assertions::StartLine => prev.unwrap_or(b'\n') == b'\n',
+                Assertions::EndLine => next.unwrap_or(b'\n') == b'\n',
+                Assertions::AsciiWordBoundary => {
+                    prev.map_or(false, is_word_byte) != next.map_or(false, is_word_byte)
+                }
+                Assertions::AsciiNotWordBoundary => {
+                    prev.map_or(false, is_word_byte) == next.map_or(false, is_word_byte)
+                }
+            };
+            if !passed {
+                return false;
+            }
+        }
+        true
+    }
 }
 
 struct Threads<'a> {
@@ -249,7 +338,7 @@ impl<'a> Threads<'a> {
             active: BitVec::repeat(false, program.buf.len()),
             list: Vec::new(),
         };
-        result.add(0, 0, Rc::new(saved));
+        result.add(0, Thread::new(0, Rc::new(saved)));
         result
     }
 
@@ -258,30 +347,41 @@ impl<'a> Threads<'a> {
         self.active.fill(false);
     }
 
-    fn add(&mut self, idx: usize, pc: u16, mut saved: Rc<Vec<usize>>) {
-        if self.active.replace(pc as usize, true) {
+    fn add(&mut self, idx: usize, mut thread: Thread) {
+        if self.active.replace(thread.pc as usize, true) {
             return;
         }
         // NFA epsilon closure: a thread can only stop on Range or Match instructions. For anything
         // else, recurse on the targets of the instruction. Note that this recursion is at worst
         // O(n) in the number of instructions; any epsilon cycles are broken using self.active.
-        match self.program.buf[pc as usize] {
+        match self.program.buf[thread.pc as usize] {
             Inst::Range(_, _) | Inst::Match(_) => {
-                self.list.push(Thread { pc, saved });
+                self.list.push(thread);
+            }
+            Inst::Assertion(kind) => {
+                thread.assertions |= kind;
+                self.add(idx, thread.next());
             }
             Inst::Save(reg) => {
-                Rc::make_mut(&mut saved)[reg as usize] = idx;
-                self.add(idx, pc + 1, saved);
+                Rc::make_mut(&mut thread.saved)[reg as usize] = idx;
+                self.add(idx, thread.next());
             }
-            Inst::Jmp(to) => self.add(idx, to, saved),
+            Inst::Jmp(pc) => self.add(idx, Thread { pc, ..thread }),
             Inst::Split { prefer_next, to } => {
                 let (a, b) = if prefer_next {
-                    (pc + 1, to)
+                    (thread.pc + 1, to)
                 } else {
-                    (to, pc + 1)
+                    (to, thread.pc + 1)
                 };
-                self.add(idx, a, saved.clone());
-                self.add(idx, b, saved);
+                self.add(
+                    idx,
+                    Thread {
+                        pc: a,
+                        saved: thread.saved.clone(),
+                        ..thread
+                    },
+                );
+                self.add(idx, Thread { pc: b, ..thread });
             }
         }
     }
@@ -293,72 +393,67 @@ mod test {
 
     #[test]
     fn optional_ab() {
-        // (ab)?(ab)?(ab)?$ (not anchored at start)
-        let p = compile(".*?(ab)?(ab)?(ab)?").unwrap();
+        // note, not anchored at start:
+        let p = compile("(ab)?(ab)?(ab)?$").unwrap();
         let input = b"abababab";
 
-        let matches = p.fullmatch(input);
+        let matches = p.exec(input);
         assert_eq!(matches, HashMap::from([(0, vec![2, 4, 4, 6, 6, 8])]));
     }
 
     #[test]
     fn unanchored_prefix() {
-        // (a*)b?c?$ (not anchored at start)
-        let p = compile(".*?(a*)b?c?").unwrap();
+        let p = compile("(a*)b?c?$").unwrap();
         let input = b"abacba";
 
-        let matches = p.fullmatch(input);
+        let matches = p.exec(input);
         assert_eq!(matches, HashMap::from([(0, vec![5, 6])]));
     }
 
     #[test]
     fn a_plus_aba() {
-        // ^(?:(a+)(aba?))*$
-        let p = compile("(?:(a+)(aba?))*").unwrap();
+        let p = compile("^(?:(a+)(aba?))*$").unwrap();
         let input = b"aabaaaba";
 
-        let matches = p.fullmatch(input);
+        let matches = p.exec(input);
         assert_eq!(matches, HashMap::from([(0, vec![4, 5, 5, 8])]));
     }
 
     #[test]
     fn star_star() {
-        let p = compile("a**").unwrap();
+        let p = compile("^a**$").unwrap();
 
-        assert_eq!(p.fullmatch(b""), HashMap::from([(0, vec![])]));
+        assert_eq!(p.exec(b""), HashMap::from([(0, vec![])]));
 
-        assert_eq!(p.fullmatch(b"a"), HashMap::from([(0, vec![])]));
+        assert_eq!(p.exec(b"a"), HashMap::from([(0, vec![])]));
 
-        assert_eq!(p.fullmatch(b"aa"), HashMap::from([(0, vec![])]));
+        assert_eq!(p.exec(b"aa"), HashMap::from([(0, vec![])]));
     }
 
     #[test]
     fn nested_captures() {
-        // ^((a)b)$
-        let p = compile("((a)b)").unwrap();
+        let p = compile("^((a)b)$").unwrap();
         let input = b"ab";
 
-        let matches = p.fullmatch(input);
+        let matches = p.exec(input);
         assert_eq!(matches, HashMap::from([(0, vec![0, 2, 0, 1])]));
     }
 
     #[test]
     fn leftmost_greedy() {
-        // ^(?:(a*)(a*)(a*))*(b+)$
-        let p = compile("(?:(a*)(a*)(a*))*(b+)").unwrap();
+        let p = compile("^(?:(a*)(a*)(a*))*(b+)$").unwrap();
         let input = b"aabb";
 
-        let matches = p.fullmatch(input);
+        let matches = p.exec(input);
         assert_eq!(matches, HashMap::from([(0, vec![0, 2, 2, 2, 2, 2, 2, 4])]));
     }
 
     #[test]
     fn many_empty() {
-        // ^((a*)(a*)(a*)|(a*)(a*)(a*)|(a*)(a*)(a*)|(a*)(a*)(a*))*$
-        let p = compile("((a*)(a*)(a*)|(a*)(a*)(a*)|(a*)(a*)(a*)|(a*)(a*)(a*))*").unwrap();
+        let p = compile("^((a*)(a*)(a*)|(a*)(a*)(a*)|(a*)(a*)(a*)|(a*)(a*)(a*))*$").unwrap();
         let input = b"aaa";
 
-        let matches = p.fullmatch(input);
+        let matches = p.exec(input);
         assert_eq!(
             matches,
             HashMap::from([(
@@ -398,24 +493,23 @@ mod test {
     #[test]
     fn overlap_combined() {
         // report matches for both ^(abc)$ and ^a(b*)c$ on the same string
-        let p = compile_set(&["(abc)", "a(b*)c"]).unwrap();
+        let p = compile_set(&["^(abc)$", "^a(b*)c$"]).unwrap();
 
-        let matches = p.fullmatch(b"abc");
+        let matches = p.exec(b"abc");
         assert_eq!(matches, HashMap::from([(0, vec![0, 3]), (1, vec![1, 2]),]));
 
-        let matches = p.fullmatch(b"ac");
+        let matches = p.exec(b"ac");
         assert_eq!(matches, HashMap::from([(1, vec![1, 1]),]));
 
-        let matches = p.fullmatch(b"abbc");
+        let matches = p.exec(b"abbc");
         assert_eq!(matches, HashMap::from([(1, vec![1, 3]),]));
     }
 
     #[test]
     fn pathological() {
-        // ^a*a*a*a*a*a*a*a*a*b$
-        let p = compile("a*a*a*a*a*a*a*a*a*b").unwrap();
+        let p = compile("^a*a*a*a*a*a*a*a*a*b$").unwrap();
         let input = b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaabc";
 
-        assert_eq!(p.fullmatch(input), HashMap::new());
+        assert_eq!(p.exec(input), HashMap::new());
     }
 }

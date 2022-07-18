@@ -3,7 +3,7 @@ use pikevm::compile_set;
 fn main() -> regex_syntax::Result<()> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     let (input, patterns) = args.split_last().unwrap();
-    for (idx, captures) in compile_set(patterns)?.fullmatch(input.as_bytes()) {
+    for (idx, captures) in compile_set(patterns)?.exec(input.as_bytes()) {
         println!(
             "MATCH: pattern '{}', input '{}'",
             patterns[idx as usize], input
