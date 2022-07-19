@@ -2,7 +2,7 @@ use bitvec::vec::BitVec;
 use flagset::{flags, FlagSet};
 use regex_syntax::hir::{self, Hir, HirKind};
 use regex_syntax::utf8::Utf8Sequences;
-use regex_syntax::{is_word_byte, Parser};
+use regex_syntax::{is_word_byte, ParserBuilder};
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -19,9 +19,13 @@ pub fn compile_set<S: AsRef<str>>(
         registers: 2,
     };
 
+    let mut parse_config = ParserBuilder::new();
+    parse_config.allow_invalid_utf8(true);
+    parse_config.unicode(false);
+
     let hirs = pats
         .into_iter()
-        .map(|pat| Parser::new().parse(pat.as_ref()))
+        .map(|pat| parse_config.build().parse(pat.as_ref()))
         .collect::<regex_syntax::Result<Vec<Hir>>>()?;
 
     result.alts(hirs.into_iter().enumerate().map(|(idx, hir)| {

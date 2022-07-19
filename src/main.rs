@@ -3,7 +3,8 @@ use pikevm::compile_set;
 fn main() -> regex_syntax::Result<()> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     let (input, patterns) = args.split_last().unwrap();
-    for (idx, captures) in compile_set(patterns)?.exec(input.as_bytes()) {
+    let input_bytes = input.as_bytes();
+    for (idx, captures) in compile_set(patterns)?.exec(input_bytes) {
         println!(
             "MATCH: pattern '{}', input '{}'",
             patterns[idx as usize], input
@@ -15,7 +16,12 @@ fn main() -> regex_syntax::Result<()> {
             if start == usize::MAX {
                 println!("no match");
             } else {
-                println!("\"{}\" ({},{})", &input[start..end], start, end);
+                println!(
+                    "\"{}\" ({},{})",
+                    String::from_utf8_lossy(&input_bytes[start..end]),
+                    start,
+                    end
+                );
             }
         }
     }
