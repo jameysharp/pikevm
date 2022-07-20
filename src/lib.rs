@@ -3,17 +3,10 @@ use flagset::{flags, FlagSet};
 use regex_syntax::hir::{self, Hir, HirKind};
 use regex_syntax::utf8::Utf8Sequences;
 use regex_syntax::{is_word_byte, ParserBuilder};
-use std::collections::hash_map::Entry;
-use std::collections::HashMap;
+use std::borrow::Borrow;
 use std::rc::Rc;
 
 pub fn compile(pat: &str) -> regex_syntax::Result<Program> {
-    compile_set([pat])
-}
-
-pub fn compile_set<S: AsRef<str>>(
-    pats: impl IntoIterator<Item = S>,
-) -> regex_syntax::Result<Program> {
     let mut result = Program {
         buf: Vec::new(),
         registers: 2,
@@ -23,35 +16,20 @@ pub fn compile_set<S: AsRef<str>>(
     parse_config.allow_invalid_utf8(true);
     parse_config.unicode(false);
 
-    let hirs = pats
-        .into_iter()
-        .map(|pat| parse_config.build().parse(pat.as_ref()))
-        .collect::<regex_syntax::Result<Vec<Hir>>>()?;
+    let hir = parse_config.build().parse(pat)?;
 
-    result.alts(hirs.into_iter().enumerate().map(|(idx, hir)| {
-        move |p: &mut Program| {
-            // Every regex in the set gets its own collection of threads during matching, and
-            // every thread has its own distinct registers, so different regexes can use the
-            // same register indexes without overwriting each other's capture groups.
-            let registers = p.registers;
-            p.registers = 0;
+    if !hir.is_anchored_start() {
+        result.compile_hir(&Hir::repetition(hir::Repetition {
+            kind: hir::RepetitionKind::ZeroOrMore,
+            greedy: false,
+            hir: Box::new(Hir::any(true)),
+        }));
+    }
 
-            if !hir.is_anchored_start() {
-                p.compile_hir(&Hir::repetition(hir::Repetition {
-                    kind: hir::RepetitionKind::ZeroOrMore,
-                    greedy: false,
-                    hir: Box::new(Hir::any(true)),
-                }));
-            }
-
-            p.push(Inst::Save(0));
-            p.compile_hir(&hir);
-            p.push(Inst::Save(1));
-            p.push(Inst::Match(idx as _));
-
-            p.registers = registers.max(p.registers);
-        }
-    }));
+    result.push(Inst::Save(0));
+    result.compile_hir(&hir);
+    result.push(Inst::Save(1));
+    result.push(Inst::Match);
 
     dbg!(&result);
     Ok(result)
@@ -72,7 +50,7 @@ flags! {
 enum Inst {
     Range(u8, u8),
     Assertion(Assertions),
-    Match(u16),
+    Match,
     Save(u16),
     Jmp(u16),
     Split { prefer_next: bool, to: u16 },
@@ -223,74 +201,82 @@ impl Program {
         }
     }
 
-    pub fn exec(&self, input: &[u8]) -> HashMap<u16, Vec<usize>> {
-        let mut threads = Threads::new(self);
-        let mut current = Vec::new();
-        let mut max_threads = threads.list.len();
-        let mut best = HashMap::new();
+    pub fn exec(&self, input: &[u8]) -> Option<Vec<usize>> {
+        exec_many(input, &[self]).into_iter().next().unwrap()
+    }
+}
 
-        let mut save_match = |match_idx, captures: Rc<Vec<usize>>| match best.entry(match_idx) {
-            Entry::Vacant(e) => {
-                e.insert(captures);
-            }
-            Entry::Occupied(e) => {
-                let previous = e.into_mut();
-                if previous[0] == captures[0] && previous[1] < captures[1] {
-                    *previous = captures;
-                }
-            }
-        };
+pub fn exec_many(input: &[u8], patterns: &[impl Borrow<Program>]) -> Vec<Option<Vec<usize>>> {
+    let mut patterns = patterns
+        .iter()
+        .map(|pattern| (Threads::new(pattern.borrow()), None))
+        .collect::<Vec<_>>();
+    let mut current = Vec::new();
 
-        let mut last_sp = None;
-        for (idx, sp) in input.iter().copied().enumerate() {
+    let mut last_sp = None;
+    for (idx, sp) in input.iter().copied().enumerate() {
+        dbg!(idx, sp);
+
+        let mut progress = false;
+        for (threads, result) in patterns.iter_mut() {
             threads.take(&mut current);
+            dbg!(&current);
             if current.is_empty() {
-                break;
+                continue;
             }
 
-            dbg!(idx, sp, &current);
-            max_threads = max_threads.max(current.len());
-
+            progress = true;
             for mut thread in current.drain(..) {
-                dbg!(thread.pc, &self.buf[thread.pc as usize]);
+                dbg!(thread.pc, &threads.program.buf[thread.pc as usize]);
 
                 if !thread.check_assertions(last_sp, Some(sp)) {
                     continue;
                 }
 
-                match self.buf[thread.pc as usize] {
+                match threads.program.buf[thread.pc as usize] {
                     Inst::Range(lo, hi) => {
                         if sp >= lo && sp <= hi {
                             threads.add(idx + 1, thread.next());
                         }
                     }
-                    Inst::Match(match_idx) => save_match(match_idx, thread.saved),
+                    Inst::Match => {
+                        *result = Some(thread.saved);
+                        dbg!(result);
+                        break;
+                    }
                     Inst::Assertion(_) | Inst::Save(_) | Inst::Jmp(_) | Inst::Split { .. } => {
                         unreachable!()
                     }
                 }
             }
-
-            last_sp = Some(sp);
         }
 
-        dbg!(max_threads, self.registers);
+        if !progress {
+            break;
+        }
 
-        debug_assert!(current.is_empty());
-        drop(current);
-        let Threads { list: current, .. } = threads;
+        last_sp = Some(sp);
+    }
 
-        for mut thread in current {
-            if let Inst::Match(match_idx) = self.buf[thread.pc as usize] {
-                if thread.check_assertions(last_sp, None) {
-                    save_match(match_idx, thread.saved);
+    debug_assert!(current.is_empty());
+    drop(current);
+
+    patterns
+        .into_iter()
+        .map(|(threads, mut result)| {
+            let Threads { list: current, .. } = threads;
+            for mut thread in current {
+                if let Inst::Match = threads.program.buf[thread.pc as usize] {
+                    if thread.check_assertions(last_sp, None) {
+                        result = Some(thread.saved);
+                        dbg!(&result);
+                        break;
+                    }
                 }
             }
-        }
-        best.into_iter()
-            .map(|(match_idx, saved)| (match_idx, (*saved).clone()))
-            .collect()
-    }
+            result.map(|rc| rc.to_vec())
+        })
+        .collect()
 }
 
 #[derive(Clone, Debug)]
@@ -368,7 +354,7 @@ impl<'a> Threads<'a> {
         // else, recurse on the targets of the instruction. Note that this recursion is at worst
         // O(n) in the number of instructions; any epsilon cycles are broken using self.active.
         match self.program.buf[thread.pc as usize] {
-            Inst::Range(_, _) | Inst::Match(_) => {
+            Inst::Range(_, _) | Inst::Match => {
                 self.list.push(thread);
             }
             Inst::Assertion(kind) => {
@@ -409,125 +395,110 @@ mod test {
         // note, not anchored at start:
         let p = compile("(ab)?(ab)?(ab)?$").unwrap();
         let input = b"abababab";
-
-        let matches = p.exec(input);
-        assert_eq!(matches, HashMap::from([(0, vec![2, 8, 2, 4, 4, 6, 6, 8])]));
+        assert_eq!(p.exec(input), Some(vec![2, 8, 2, 4, 4, 6, 6, 8]));
     }
 
     #[test]
     fn unanchored_prefix() {
         let p = compile("(a*)b?c?$").unwrap();
         let input = b"abacba";
-
-        let matches = p.exec(input);
-        assert_eq!(matches, HashMap::from([(0, vec![5, 6, 5, 6])]));
+        assert_eq!(p.exec(input), Some(vec![5, 6, 5, 6]));
     }
 
     #[test]
     fn a_plus_aba() {
         let p = compile("^(?:(a+)(aba?))*$").unwrap();
         let input = b"aabaaaba";
-
-        let matches = p.exec(input);
-        assert_eq!(matches, HashMap::from([(0, vec![0, 8, 4, 5, 5, 8])]));
+        assert_eq!(p.exec(input), Some(vec![0, 8, 4, 5, 5, 8]));
     }
 
     #[test]
     fn star_star() {
         let p = compile("a**").unwrap();
-        assert_eq!(p.exec(b""), HashMap::from([(0, vec![0, 0])]));
-        assert_eq!(p.exec(b"a"), HashMap::from([(0, vec![0, 1])]));
-        assert_eq!(p.exec(b"aa"), HashMap::from([(0, vec![0, 2])]));
+        assert_eq!(p.exec(b""), Some(vec![0, 0]));
+        assert_eq!(p.exec(b"a"), Some(vec![0, 1]));
+        assert_eq!(p.exec(b"aa"), Some(vec![0, 2]));
     }
 
     #[test]
     fn nested_captures() {
         let p = compile("^((a)b)$").unwrap();
         let input = b"ab";
-
-        let matches = p.exec(input);
-        assert_eq!(matches, HashMap::from([(0, vec![0, 2, 0, 2, 0, 1])]));
+        assert_eq!(p.exec(input), Some(vec![0, 2, 0, 2, 0, 1]));
     }
 
     #[test]
     fn leftmost_greedy() {
         let p = compile("^(?:(a*)(a*)(a*))*(b+)$").unwrap();
         let input = b"aabb";
-
-        let matches = p.exec(input);
-        assert_eq!(
-            matches,
-            HashMap::from([(0, vec![0, 4, 0, 2, 2, 2, 2, 2, 2, 4])])
-        );
+        assert_eq!(p.exec(input), Some(vec![0, 4, 0, 2, 2, 2, 2, 2, 2, 4]));
     }
 
     #[test]
     fn many_empty() {
         let p = compile("^((a*)(a*)(a*)|(a*)(a*)(a*)|(a*)(a*)(a*)|(a*)(a*)(a*))*$").unwrap();
         let input = b"aaa";
-
-        let matches = p.exec(input);
         assert_eq!(
-            matches,
-            HashMap::from([(
+            p.exec(input),
+            Some(vec![
                 0,
-                vec![
-                    0,
-                    3,
-                    0,
-                    3,
-                    0,
-                    3,
-                    3,
-                    3,
-                    3,
-                    3,
-                    usize::MAX,
-                    usize::MAX,
-                    usize::MAX,
-                    usize::MAX,
-                    usize::MAX,
-                    usize::MAX,
-                    usize::MAX,
-                    usize::MAX,
-                    usize::MAX,
-                    usize::MAX,
-                    usize::MAX,
-                    usize::MAX,
-                    usize::MAX,
-                    usize::MAX,
-                    usize::MAX,
-                    usize::MAX,
-                    usize::MAX,
-                    usize::MAX,
-                ]
-            )])
+                3,
+                0,
+                3,
+                0,
+                3,
+                3,
+                3,
+                3,
+                3,
+                usize::MAX,
+                usize::MAX,
+                usize::MAX,
+                usize::MAX,
+                usize::MAX,
+                usize::MAX,
+                usize::MAX,
+                usize::MAX,
+                usize::MAX,
+                usize::MAX,
+                usize::MAX,
+                usize::MAX,
+                usize::MAX,
+                usize::MAX,
+                usize::MAX,
+                usize::MAX,
+                usize::MAX,
+                usize::MAX,
+            ])
         );
     }
 
     #[test]
     fn overlap_combined() {
         // report matches for both ^(abc)$ and ^a(b*)c$ on the same string
-        let p = compile_set(&["^(abc)$", "^a(b*)c$"]).unwrap();
+        let p0 = compile("^(abc)$").unwrap();
+        let p1 = compile("^a(b*)c$").unwrap();
 
-        let matches = p.exec(b"abc");
         assert_eq!(
-            matches,
-            HashMap::from([(0, vec![0, 3, 0, 3]), (1, vec![0, 3, 1, 2]),])
+            exec_many(b"abc", &[&p0, &p1]),
+            vec![Some(vec![0, 3, 0, 3]), Some(vec![0, 3, 1, 2])]
         );
 
-        let matches = p.exec(b"ac");
-        assert_eq!(matches, HashMap::from([(1, vec![0, 2, 1, 1]),]));
+        assert_eq!(
+            exec_many(b"ac", &[&p0, &p1]),
+            vec![None, Some(vec![0, 2, 1, 1])]
+        );
 
-        let matches = p.exec(b"abbc");
-        assert_eq!(matches, HashMap::from([(1, vec![0, 4, 1, 3]),]));
+        assert_eq!(
+            exec_many(b"abbc", &[&p0, &p1]),
+            vec![None, Some(vec![0, 4, 1, 3])]
+        );
     }
 
     #[test]
     fn pathological() {
         let p = compile("^a*a*a*a*a*a*a*a*a*b$").unwrap();
         let input = b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaabc";
-
-        assert_eq!(p.exec(input), HashMap::new());
+        assert_eq!(p.exec(input), None);
     }
 }

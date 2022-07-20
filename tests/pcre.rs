@@ -3,7 +3,9 @@ use pikevm::compile;
 
 #[test]
 fn aaaaa() {
-    let units = &["a", "(a)", "(a*)", "(a+)", "(a?)"];
+    let units = &[
+        "a", "(a)", "(a*)", "(a+)", "(a?)", "(a*?)", "(a+?)", "(a??)",
+    ];
     let longest_input = "aaaaa";
 
     let cases = std::iter::once(String::new());
@@ -35,13 +37,7 @@ fn extend<'a>(
 
 fn check_pcre(pattern: &str, input: &str) {
     let program = compile(pattern).unwrap();
-    let results = program.exec(input.as_bytes());
-
-    let mut matches = Vec::new();
-    for (match_idx, found) in results {
-        assert_eq!(match_idx, 0);
-        matches = found;
-    }
+    let matches = program.exec(input.as_bytes()).unwrap_or_else(Vec::new);
 
     let expected = match Regex::new(pattern)
         .unwrap()
