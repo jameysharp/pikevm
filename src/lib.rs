@@ -81,20 +81,20 @@ impl Program {
         self.buf[loc as usize] = inst;
     }
 
-    fn alts<F: FnOnce(&mut Self)>(&mut self, alts: impl IntoIterator<Item = F>) {
+    fn alts<T, F: FnMut(&mut Self, T)>(&mut self, alts: impl IntoIterator<Item = T>, mut f: F) {
         let prefer_next = true; // prefer left-most successful alternative
         let mut iter = alts.into_iter();
         let mut last = iter.next().unwrap();
         let mut jmps = Vec::new();
         for next in iter {
             let split = self.placeholder();
-            last(self);
+            f(self, last);
             jmps.push(self.placeholder());
             let to = self.loc();
             self.patch(split, Inst::Split { prefer_next, to });
             last = next;
         }
-        last(self);
+        f(self, last);
         let to = self.loc();
         for jmp in jmps {
             self.patch(jmp, Inst::Jmp(to));
@@ -114,24 +114,19 @@ impl Program {
                 self.push(Inst::Range(b, b));
             }
             HirKind::Class(hir::Class::Unicode(uc)) => {
-                self.alts(
-                    uc.iter()
-                        .flat_map(|range| Utf8Sequences::new(range.start(), range.end()))
-                        .map(|seq| {
-                            move |p: &mut Program| {
-                                for byte_range in seq.as_slice() {
-                                    p.push(Inst::Range(byte_range.start, byte_range.end));
-                                }
-                            }
-                        }),
-                );
+                let seqs = uc
+                    .iter()
+                    .flat_map(|range| Utf8Sequences::new(range.start(), range.end()));
+                self.alts(seqs, |p, seq| {
+                    for byte_range in seq.as_slice() {
+                        p.push(Inst::Range(byte_range.start, byte_range.end));
+                    }
+                });
             }
             HirKind::Class(hir::Class::Bytes(bc)) => {
-                self.alts(bc.iter().map(|range| {
-                    move |p: &mut Program| {
-                        p.push(Inst::Range(range.start(), range.end()));
-                    }
-                }));
+                self.alts(bc.iter(), |p, range| {
+                    p.push(Inst::Range(range.start(), range.end()));
+                });
             }
             HirKind::Anchor(kind) => {
                 self.push(Inst::Assertion(match kind {
@@ -172,31 +167,25 @@ impl Program {
                 }
                 hir::RepetitionKind::Range(_) => unimplemented!(),
             },
-            HirKind::Group(group) => {
-                match group.kind {
-                    hir::GroupKind::CaptureIndex(index)
-                    | hir::GroupKind::CaptureName { index, .. } => {
-                        let register = (index * 2) as _;
-                        self.registers = register + 2;
-                        self.push(Inst::Save(register));
-                        self.compile_hir(&*group.hir);
-                        self.push(Inst::Save(register + 1));
-                    }
-                    hir::GroupKind::NonCapturing => {
-                        self.compile_hir(&*group.hir);
-                    }
-                };
-            }
+            HirKind::Group(group) => match group.kind {
+                hir::GroupKind::CaptureIndex(index) | hir::GroupKind::CaptureName { index, .. } => {
+                    let register = (index * 2) as _;
+                    self.registers = register + 2;
+                    self.push(Inst::Save(register));
+                    self.compile_hir(&*group.hir);
+                    self.push(Inst::Save(register + 1));
+                }
+                hir::GroupKind::NonCapturing => self.compile_hir(&*group.hir),
+            },
             HirKind::Concat(subs) => {
                 for hir in subs {
                     self.compile_hir(hir);
                 }
             }
             HirKind::Alternation(subs) => {
-                self.alts(
-                    subs.iter()
-                        .map(|hir| move |p: &mut Program| p.compile_hir(hir)),
-                );
+                self.alts(subs, |p, hir| {
+                    p.compile_hir(hir);
+                });
             }
         }
     }
@@ -265,6 +254,7 @@ pub fn exec_many(input: &[u8], patterns: &[impl Borrow<Program>]) -> Vec<Option<
         .into_iter()
         .map(|(threads, mut result)| {
             let Threads { list: current, .. } = threads;
+            dbg!(&current);
             for mut thread in current {
                 if let Inst::Match = threads.program.buf[thread.pc as usize] {
                     if thread.check_assertions(last_sp, None) {
