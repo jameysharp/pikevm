@@ -64,6 +64,13 @@ fn nested_captures() {
 }
 
 #[test]
+fn nullable_captures() {
+    check_pcre("(a*)+", "aaa");
+    check_pcre("^((a*)(a*)(a*))*", "aaa");
+    check_pcre("((a)*(a)?a*)+", "aaa");
+}
+
+#[test]
 fn leftmost_greedy() {
     check_pcre("^(?:(a*)(a*)(a*))*(b+)$", "aabb");
 }
