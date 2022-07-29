@@ -35,6 +35,44 @@ fn extend<'a>(
     })
 }
 
+#[test]
+fn optional_ab() {
+    // note, not anchored at start:
+    check_pcre("(ab)?(ab)?(ab)?$", "abababab");
+}
+
+#[test]
+fn unanchored_prefix() {
+    check_pcre("(a*)b?c?$", "abacba");
+}
+
+#[test]
+fn a_plus_aba() {
+    check_pcre("^(?:(a+)(aba?))*$", "aabaaaba");
+}
+
+#[test]
+fn star_star() {
+    check_pcre("(?:a*)*", "");
+    check_pcre("(?:a*)*", "a");
+    check_pcre("(?:a*)*", "aa");
+}
+
+#[test]
+fn nested_captures() {
+    check_pcre("^((a)b)$", "ab");
+}
+
+#[test]
+fn leftmost_greedy() {
+    check_pcre("^(?:(a*)(a*)(a*))*(b+)$", "aabb");
+}
+
+#[test]
+fn many_empty() {
+    check_pcre("^((a*)(a*)(a*)|(a*)(a*)(a*)|(a*)(a*)(a*)|(a*)(a*)(a*))*$", "aaa");
+}
+
 fn check_pcre(pattern: &str, input: &str) {
     let program = compile(pattern).unwrap();
     let matches = program.exec(input.as_bytes()).unwrap_or_else(Vec::new);
@@ -46,9 +84,9 @@ fn check_pcre(pattern: &str, input: &str) {
     {
         None => Vec::new(),
         Some(captures) => (0..captures.len())
-            .flat_map(|i| {
-                let group = captures.get(i).unwrap();
-                [group.start(), group.end()]
+            .flat_map(|i| match captures.get(i) {
+                Some(group) => [group.start(), group.end()],
+                None => [usize::MAX, usize::MAX],
             })
             .collect(),
     };
