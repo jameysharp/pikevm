@@ -77,26 +77,26 @@ fn leftmost_greedy() {
 
 #[test]
 fn many_empty() {
-    check_pcre("^((a*)(a*)(a*)|(a*)(a*)(a*)|(a*)(a*)(a*)|(a*)(a*)(a*))*$", "aaa");
+    check_pcre(
+        "^((a*)(a*)(a*)|(a*)(a*)(a*)|(a*)(a*)(a*)|(a*)(a*)(a*))*$",
+        "aaa",
+    );
 }
 
 fn check_pcre(pattern: &str, input: &str) {
     let program = compile(pattern).unwrap();
-    let matches = program.exec(input.as_bytes()).unwrap_or_else(Vec::new);
+    let matches = program.exec(input.as_bytes());
 
-    let expected = match Regex::new(pattern)
-        .unwrap()
-        .captures(input.as_bytes())
-        .unwrap()
-    {
-        None => Vec::new(),
-        Some(captures) => (0..captures.len())
+    let regex = Regex::new(pattern).unwrap();
+    let captures = regex.captures(input.as_bytes()).unwrap();
+    let expected = captures.map(|captures| {
+        (0..captures.len())
             .flat_map(|i| match captures.get(i) {
                 Some(group) => [group.start(), group.end()],
                 None => [usize::MAX, usize::MAX],
             })
-            .collect(),
-    };
+            .collect()
+    });
 
     assert_eq!(
         matches, expected,
