@@ -101,17 +101,19 @@ impl Program {
         }
     }
 
-    fn compile_hir(&mut self, hir: &Hir) {
+    fn compile_hir(&mut self, hir: &Hir) -> bool {
         match hir.kind() {
-            HirKind::Empty => {}
+            HirKind::Empty => true,
             HirKind::Literal(hir::Literal::Unicode(u)) => {
                 let mut buf = [0; 4];
                 for b in u.encode_utf8(&mut buf).bytes() {
                     self.push(Inst::Range(b, b));
                 }
+                false
             }
             &HirKind::Literal(hir::Literal::Byte(b)) => {
                 self.push(Inst::Range(b, b));
+                false
             }
             HirKind::Class(hir::Class::Unicode(uc)) => {
                 let seqs = uc
@@ -122,11 +124,13 @@ impl Program {
                         p.push(Inst::Range(byte_range.start, byte_range.end));
                     }
                 });
+                false
             }
             HirKind::Class(hir::Class::Bytes(bc)) => {
                 self.alts(bc.iter(), |p, range| {
                     p.push(Inst::Range(range.start(), range.end()));
                 });
+                false
             }
             HirKind::Anchor(kind) => {
                 self.push(Inst::Assertion(match kind {
@@ -135,6 +139,7 @@ impl Program {
                     hir::Anchor::StartText => Assertions::StartText,
                     hir::Anchor::EndText => Assertions::EndText,
                 }));
+                true
             }
             HirKind::WordBoundary(kind) => {
                 self.push(Inst::Assertion(match kind {
@@ -142,28 +147,41 @@ impl Program {
                     hir::WordBoundary::AsciiNegate => Assertions::AsciiNotWordBoundary,
                     _ => unimplemented!(),
                 }));
+                true
             }
             HirKind::Repetition(rep) => match rep.kind {
                 hir::RepetitionKind::ZeroOrOne => {
                     let split = self.placeholder();
-                    self.compile_hir(&*rep.hir);
+                    let nullable = self.compile_hir(&*rep.hir);
                     let to = self.loc();
                     let prefer_next = rep.greedy;
                     self.patch(split, Inst::Split { prefer_next, to });
+                    if nullable {
+                        self.nullable_captures(&*rep.hir);
+                    }
+                    true
                 }
                 hir::RepetitionKind::ZeroOrMore => {
                     let split = self.placeholder();
-                    self.compile_hir(&*rep.hir);
+                    let nullable = self.compile_hir(&*rep.hir);
                     self.push(Inst::Jmp(split));
                     let to = self.loc();
                     let prefer_next = rep.greedy;
                     self.patch(split, Inst::Split { prefer_next, to });
+                    if nullable {
+                        self.nullable_captures(&*rep.hir);
+                    }
+                    true
                 }
                 hir::RepetitionKind::OneOrMore => {
                     let to = self.loc();
-                    self.compile_hir(&*rep.hir);
+                    let nullable = self.compile_hir(&*rep.hir);
                     let prefer_next = !rep.greedy;
                     self.push(Inst::Split { prefer_next, to });
+                    if nullable {
+                        self.nullable_captures(&*rep.hir);
+                    }
+                    nullable
                 }
                 hir::RepetitionKind::Range(_) => unimplemented!(),
             },
@@ -172,21 +190,72 @@ impl Program {
                     let register = (index * 2) as _;
                     self.registers = register + 2;
                     self.push(Inst::Save(register));
-                    self.compile_hir(&*group.hir);
+                    let nullable = self.compile_hir(&*group.hir);
                     self.push(Inst::Save(register + 1));
+                    nullable
                 }
                 hir::GroupKind::NonCapturing => self.compile_hir(&*group.hir),
             },
             HirKind::Concat(subs) => {
+                let mut nullable = true;
                 for hir in subs {
-                    self.compile_hir(hir);
+                    nullable &= self.compile_hir(hir);
                 }
+                nullable
             }
             HirKind::Alternation(subs) => {
+                let mut nullable = false;
                 self.alts(subs, |p, hir| {
-                    p.compile_hir(hir);
+                    nullable |= p.compile_hir(hir);
                 });
+                nullable
             }
+        }
+    }
+
+    /// Fix up match positions to match PCRE's weird behavior on repetitions of subexpressions
+    /// which can match the empty string. Any nested groups that would capture when the whole
+    /// subexpression is given the empty string should always capture after the repetition ends.
+    fn nullable_captures(&mut self, hir: &Hir) -> bool {
+        let undo = self.buf.len();
+        let mut try_sub = |hir| {
+            let nullable = self.nullable_captures(hir);
+            if !nullable {
+                self.buf.truncate(undo);
+            }
+            nullable
+        };
+        match hir.kind() {
+            HirKind::Empty => true,
+            HirKind::Literal(_) => false,
+            HirKind::Class(_) => false,
+            HirKind::Anchor(_) => true,
+            HirKind::WordBoundary(_) => true,
+            HirKind::Repetition(rep) => {
+                let nullable = try_sub(&*rep.hir);
+                match rep.kind {
+                    hir::RepetitionKind::ZeroOrOne | hir::RepetitionKind::ZeroOrMore => true,
+                    hir::RepetitionKind::OneOrMore => nullable,
+                    hir::RepetitionKind::Range(_) => unimplemented!(),
+                }
+            }
+            HirKind::Group(group) => {
+                let nullable = try_sub(&*group.hir);
+                match group.kind {
+                    hir::GroupKind::CaptureIndex(index)
+                    | hir::GroupKind::CaptureName { index, .. } => {
+                        if nullable {
+                            let register = (index * 2) as _;
+                            self.push(Inst::Save(register));
+                            self.push(Inst::Save(register + 1));
+                        }
+                    }
+                    hir::GroupKind::NonCapturing => {}
+                }
+                nullable
+            }
+            HirKind::Concat(subs) => subs.iter().all(try_sub),
+            HirKind::Alternation(subs) => subs.iter().any(try_sub),
         }
     }
 
