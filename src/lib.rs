@@ -6,6 +6,8 @@ use regex_syntax::{is_word_byte, ParserBuilder};
 use std::borrow::Borrow;
 use std::rc::Rc;
 
+pub mod dfa;
+
 pub fn compile(pat: &str) -> regex_syntax::Result<Program> {
     let mut result = Program {
         buf: Vec::new(),
@@ -261,6 +263,10 @@ impl Program {
 
     pub fn exec(&self, input: &[u8]) -> Option<Vec<usize>> {
         exec_many(input, &[self]).into_iter().next().unwrap()
+    }
+
+    pub fn to_dfa(&self) -> dfa::DFA {
+        dfa::DFA::new(self)
     }
 }
 

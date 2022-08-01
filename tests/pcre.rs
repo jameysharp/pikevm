@@ -72,6 +72,8 @@ fn nullable_captures() {
 
 #[test]
 fn leftmost_greedy() {
+    check_pcre("^(?:(a*)(a*)(a*))*(b+)$", "b");
+    check_pcre("^(?:(a*)(a*)(a*))*(b+)$", "ab");
     check_pcre("^(?:(a*)(a*)(a*))*(b+)$", "aabb");
 }
 
@@ -86,6 +88,8 @@ fn many_empty() {
 fn check_pcre(pattern: &str, input: &str) {
     let program = compile(pattern).unwrap();
     let matches = program.exec(input.as_bytes());
+    let dfa = program.to_dfa();
+    let dfa_matches = dfa.exec(input.as_bytes());
 
     let regex = Regex::new(pattern).unwrap();
     let captures = regex.captures(input.as_bytes()).unwrap();
@@ -101,5 +105,12 @@ fn check_pcre(pattern: &str, input: &str) {
     assert_eq!(
         matches, expected,
         "wrong captures for /{pattern}/ on '{input}'",
+    );
+
+    assert_eq!(
+        dfa_matches,
+        expected,
+        "wrong captures for DFA of /{pattern}/ on '{input}':\n{}",
+        dfa.to_dot(),
     );
 }

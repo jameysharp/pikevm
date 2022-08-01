@@ -9,6 +9,11 @@ fn main() -> regex_syntax::Result<()> {
         .collect::<Result<Vec<_>, _>>()?;
     let input_bytes = input.as_bytes();
     let results = exec_many(input_bytes, &compiled);
+
+    for program in compiled.iter() {
+        eprintln!("{}", program.to_dfa().to_dot());
+    }
+
     for (pattern, captures) in patterns.iter().zip(results) {
         if let Some(captures) = captures {
             println!("MATCH: pattern '{}', input '{}'", pattern, input);
