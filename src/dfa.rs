@@ -394,7 +394,19 @@ impl<'a> Builder<'a> {
             };
 
         match self.program.buf[usize::from(pc)] {
-            Inst::Range(..) | Inst::Match => self.add_state(lo, hi, last, Some((pc, next))),
+            Inst::Range(..) => self.add_state(lo, hi, last, Some((pc, next))),
+            Inst::Match => {
+                // If we haven't constrained what can come next in the input, then we can declare
+                // this a match immediately. Otherwise we need to try to read one more byte of
+                // input to decide whether this branch actually matched.
+                if next == Anything {
+                    self.current_effects.push(Effect::Match);
+                    self.add_state(lo, hi, last, None);
+                    self.current_effects.pop();
+                } else {
+                    self.add_state(lo, hi, last, Some((pc, next)));
+                }
+            }
             // After matching a byte, StartText can't match; prune here.
             Inst::Assertion(Assertions::StartText) => {}
             // After matching a byte, StartLine can only match if it was the end of a line.
