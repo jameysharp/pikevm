@@ -47,6 +47,12 @@ fn unanchored_prefix() {
 }
 
 #[test]
+fn misordered() {
+    check_pcre("$^", "");
+    check_pcre("$^", "a");
+}
+
+#[test]
 fn a_plus_aba() {
     check_pcre("^(?:(a+)(aba?))*$", "aabaaaba");
 }
