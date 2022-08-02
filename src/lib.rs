@@ -1,5 +1,4 @@
 use bitvec::vec::BitVec;
-use flagset::{flags, FlagSet};
 use regex_syntax::hir::{self, Hir, HirKind};
 use regex_syntax::utf8::Utf8Sequences;
 use regex_syntax::{is_word_byte, ParserBuilder};
@@ -37,15 +36,14 @@ pub fn compile(pat: &str) -> regex_syntax::Result<Program> {
     Ok(result)
 }
 
-flags! {
-    enum Assertions: u8 {
-        StartLine,
-        EndLine,
-        StartText,
-        EndText,
-        AsciiWordBoundary,
-        AsciiNotWordBoundary,
-    }
+#[derive(Clone, Copy, Debug)]
+enum Assertions {
+    StartLine,
+    EndLine,
+    StartText,
+    EndText,
+    AsciiWordBoundary,
+    AsciiNotWordBoundary,
 }
 
 #[derive(Clone, Debug)]
@@ -273,48 +271,19 @@ impl Program {
 pub fn exec_many(input: &[u8], patterns: &[impl Borrow<Program>]) -> Vec<Option<Vec<usize>>> {
     let mut patterns = patterns
         .iter()
-        .map(|pattern| (Threads::new(pattern.borrow()), None))
+        .map(|pattern| Threads::new(pattern.borrow()))
         .collect::<Vec<_>>();
-    let mut current = Vec::new();
 
     let mut last_sp = None;
     for (idx, sp) in input.iter().copied().enumerate() {
         dbg!(idx, sp);
 
         let mut progress = false;
-        for (threads, result) in patterns.iter_mut() {
-            threads.take(&mut current);
-            dbg!(&current);
-            if current.is_empty() {
-                continue;
-            }
-
-            progress = true;
-            for mut thread in current.drain(..) {
-                dbg!(thread.pc, &threads.program.buf[thread.pc as usize]);
-
-                if !thread.check_assertions(last_sp, Some(sp)) {
-                    continue;
-                }
-
-                match threads.program.buf[thread.pc as usize] {
-                    Inst::Range(lo, hi) => {
-                        if sp >= lo && sp <= hi {
-                            threads.add(idx + 1, thread.next());
-                        }
-                    }
-                    Inst::Match => {
-                        *result = Some(thread.saved);
-                        dbg!(result);
-                        break;
-                    }
-                    Inst::Assertion(_) | Inst::Save(_) | Inst::Jmp(_) | Inst::Split { .. } => {
-                        unreachable!()
-                    }
-                }
-            }
+        for threads in patterns.iter_mut() {
+            progress |= threads.step(idx, last_sp, Some(sp));
         }
 
+        // If every pattern is stuck (no more threads can match), we can stop processing the input.
         if !progress {
             break;
         }
@@ -322,24 +291,12 @@ pub fn exec_many(input: &[u8], patterns: &[impl Borrow<Program>]) -> Vec<Option<
         last_sp = Some(sp);
     }
 
-    debug_assert!(current.is_empty());
-    drop(current);
-
     patterns
         .into_iter()
-        .map(|(threads, mut result)| {
-            let Threads { list: current, .. } = threads;
-            dbg!(&current);
-            for mut thread in current {
-                if let Inst::Match = threads.program.buf[thread.pc as usize] {
-                    if thread.check_assertions(last_sp, None) {
-                        result = Some(thread.saved);
-                        dbg!(&result);
-                        break;
-                    }
-                }
-            }
-            result.map(|rc| rc.to_vec())
+        .map(|mut threads| {
+            // Note that if we stopped due to all patterns getting stuck, then `step` is a no-op.
+            threads.step(input.len(), last_sp, None);
+            threads.result.map(|rc| rc.to_vec())
         })
         .collect()
 }
@@ -348,42 +305,12 @@ pub fn exec_many(input: &[u8], patterns: &[impl Borrow<Program>]) -> Vec<Option<
 struct Thread {
     pc: u16,
     saved: Rc<Vec<usize>>,
-    assertions: FlagSet<Assertions>,
 }
 
 impl Thread {
-    fn new(pc: u16, saved: Rc<Vec<usize>>) -> Self {
-        Thread {
-            pc,
-            saved,
-            assertions: FlagSet::default(),
-        }
-    }
-
     fn next(mut self) -> Self {
         self.pc += 1;
         self
-    }
-
-    fn check_assertions(&mut self, prev: Option<u8>, next: Option<u8>) -> bool {
-        for assertion in self.assertions.drain() {
-            let passed = match assertion {
-                Assertions::StartText => prev.is_none(),
-                Assertions::EndText => next.is_none(),
-                Assertions::StartLine => prev.unwrap_or(b'\n') == b'\n',
-                Assertions::EndLine => next.unwrap_or(b'\n') == b'\n',
-                Assertions::AsciiWordBoundary => {
-                    prev.map_or(false, is_word_byte) != next.map_or(false, is_word_byte)
-                }
-                Assertions::AsciiNotWordBoundary => {
-                    prev.map_or(false, is_word_byte) == next.map_or(false, is_word_byte)
-                }
-            };
-            if !passed {
-                return false;
-            }
-        }
-        true
     }
 }
 
@@ -391,61 +318,90 @@ struct Threads<'a> {
     program: &'a Program,
     active: BitVec,
     list: Vec<Thread>,
+    result: Option<Rc<Vec<usize>>>,
 }
 
 impl<'a> Threads<'a> {
     fn new(program: &Program) -> Threads {
-        let mut saved = Vec::new();
-        saved.resize(program.registers as usize, usize::MAX);
         let mut result = Threads {
             program,
             active: BitVec::repeat(false, program.buf.len()),
             list: Vec::new(),
+            result: None,
         };
-        result.add(0, Thread::new(0, Rc::new(saved)));
+        result.list.push(Thread {
+            pc: 0,
+            saved: Rc::new(vec![usize::MAX; program.registers.into()]),
+        });
         result
     }
 
-    fn take(&mut self, buf: &mut Vec<Thread>) {
-        std::mem::swap(&mut self.list, buf);
+    fn step(&mut self, idx: usize, prev: Option<u8>, next: Option<u8>) -> bool {
+        if self.list.is_empty() {
+            return false;
+        }
         self.active.fill(false);
+        for thread in std::mem::take(&mut self.list) {
+            dbg!(&thread, &self.program.buf[thread.pc as usize]);
+            if self.add(idx, thread, prev, next) {
+                // found a Match, which supersedes any lower-priority threads
+                break;
+            }
+        }
+        true
     }
 
-    fn add(&mut self, idx: usize, mut thread: Thread) {
+    fn add(&mut self, idx: usize, mut thread: Thread, prev: Option<u8>, next: Option<u8>) -> bool {
         if self.active.replace(thread.pc as usize, true) {
-            return;
+            return false;
         }
         // NFA epsilon closure: a thread can only stop on Range or Match instructions. For anything
         // else, recurse on the targets of the instruction. Note that this recursion is at worst
         // O(n) in the number of instructions; any epsilon cycles are broken using self.active.
         match self.program.buf[thread.pc as usize] {
-            Inst::Range(_, _) | Inst::Match => {
-                self.list.push(thread);
+            Inst::Range(lo, hi) => {
+                if let Some(sp) = next {
+                    if sp >= lo && sp <= hi {
+                        self.list.push(thread.next());
+                    }
+                }
+                false
+            }
+            Inst::Match => {
+                self.result = Some(thread.saved);
+                dbg!(&self.result);
+                // unwind, discarding all lower-priority threads
+                true
             }
             Inst::Assertion(kind) => {
-                thread.assertions |= kind;
-                self.add(idx, thread.next());
+                let passed = match kind {
+                    Assertions::StartText => prev.is_none(),
+                    Assertions::EndText => next.is_none(),
+                    Assertions::StartLine => prev.unwrap_or(b'\n') == b'\n',
+                    Assertions::EndLine => next.unwrap_or(b'\n') == b'\n',
+                    Assertions::AsciiWordBoundary => {
+                        prev.map_or(false, is_word_byte) != next.map_or(false, is_word_byte)
+                    }
+                    Assertions::AsciiNotWordBoundary => {
+                        prev.map_or(false, is_word_byte) == next.map_or(false, is_word_byte)
+                    }
+                };
+                // short-circuit if the assertion failed
+                passed && self.add(idx, thread.next(), prev, next)
             }
             Inst::Save(reg) => {
                 Rc::make_mut(&mut thread.saved)[reg as usize] = idx;
-                self.add(idx, thread.next());
+                self.add(idx, thread.next(), prev, next)
             }
-            Inst::Jmp(pc) => self.add(idx, Thread { pc, ..thread }),
+            Inst::Jmp(pc) => self.add(idx, Thread { pc, ..thread }, prev, next),
             Inst::Split { prefer_next, to } => {
-                let (a, b) = if prefer_next {
-                    (thread.pc + 1, to)
-                } else {
-                    (to, thread.pc + 1)
-                };
-                self.add(
-                    idx,
-                    Thread {
-                        pc: a,
-                        saved: thread.saved.clone(),
-                        ..thread
-                    },
-                );
-                self.add(idx, Thread { pc: b, ..thread });
+                let mut a = thread.clone().next();
+                let mut b = Thread { pc: to, ..thread };
+                if !prefer_next {
+                    std::mem::swap(&mut a, &mut b);
+                }
+                // short-circuit if the first thread gets a Match
+                self.add(idx, a, prev, next) || self.add(idx, b, prev, next)
             }
         }
     }

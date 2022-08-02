@@ -53,6 +53,11 @@ fn misordered() {
 }
 
 #[test]
+fn optional_failed_assertion() {
+    check_pcre("^a(?:^)?b$", "ab");
+}
+
+#[test]
 fn a_plus_aba() {
     check_pcre("^(?:(a+)(aba?))*$", "aabaaaba");
 }
