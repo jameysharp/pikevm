@@ -62,11 +62,7 @@ impl Constraint {
             .filter(|(range_lo, range_hi)| range_lo <= range_hi)
     }
 
-    fn overlaps(self, lo: u8, hi: u8) -> bool {
-        self.ranges(lo, hi).next().is_some()
-    }
-
-    fn intersection(self, other: Self) -> Option<Self> {
+    fn and(self, other: Self) -> Option<Self> {
         use Constraint::*;
         match (self, other) {
             _ if self == other => Some(self),
@@ -120,7 +116,7 @@ fn initial_states(program: &Program) -> Vec<Thread> {
                     Assertions::AsciiWordBoundary => Constraint::WordByte,
                     Assertions::AsciiNotWordBoundary => Constraint::NotWordByte,
                 };
-                if let Some(constraint) = current.constraint.intersection(constraint) {
+                if let Some(constraint) = current.constraint.and(constraint) {
                     current.constraint = constraint;
                     go(program, result, active, current.next());
                 }
@@ -382,71 +378,38 @@ impl<'a> Builder<'a> {
     }
 
     fn gather(&mut self, pc: u16, lo: u8, hi: u8, last: Constraint, next: Constraint) {
+        use Constraint::*;
         let active = &mut self.active[usize::from(pc)];
         if !active.is_disjoint(next) {
             return;
         }
         *active |= next;
 
+        let constrain =
+            |this: &mut Self, new_last, new_next| match (last.and(new_last), next.and(new_next)) {
+                (Some(last), Some(next)) if last.ranges(lo, hi).next().is_some() => {
+                    this.gather(pc + 1, lo, hi, last, next);
+                }
+                _ => {}
+            };
+
         match self.program.buf[usize::from(pc)] {
             Inst::Range(..) | Inst::Match => self.add_state(lo, hi, last, Some((pc, next))),
-            Inst::Assertion(kind) => {
-                match kind {
-                    // After matching a byte, StartText can't match; prune here.
-                    Assertions::StartText => {}
-                    // After matching a byte, StartLine can only match if it was the end of a line.
-                    Assertions::StartLine => {
-                        if let Some(last) = last.intersection(Constraint::Newline) {
-                            if last.overlaps(lo, hi) {
-                                self.gather(pc + 1, lo, hi, last, next);
-                            }
-                        }
-                    }
-                    // These assertions apply to the following byte, not the preceding one.
-                    Assertions::EndLine => {
-                        if let Some(next) = next.intersection(Constraint::Newline) {
-                            self.gather(pc + 1, lo, hi, last, next);
-                        }
-                    }
-                    Assertions::EndText => {
-                        if let Some(next) = next.intersection(Constraint::EndText) {
-                            self.gather(pc + 1, lo, hi, last, next);
-                        }
-                    }
-                    // Word boundaries need the preceding byte range split into word/non-word.
-                    Assertions::AsciiWordBoundary => {
-                        if let Some(last) = last.intersection(Constraint::WordByte) {
-                            if last.overlaps(lo, hi) {
-                                if let Some(next) = next.intersection(Constraint::NotWordByte) {
-                                    self.gather(pc + 1, lo, hi, last, next);
-                                }
-                            }
-                        }
-                        if let Some(last) = last.intersection(Constraint::NotWordByte) {
-                            if last.overlaps(lo, hi) {
-                                if let Some(next) = next.intersection(Constraint::WordByte) {
-                                    self.gather(pc + 1, lo, hi, last, next);
-                                }
-                            }
-                        }
-                    }
-                    Assertions::AsciiNotWordBoundary => {
-                        if let Some(last) = last.intersection(Constraint::WordByte) {
-                            if last.overlaps(lo, hi) {
-                                if let Some(next) = next.intersection(Constraint::WordByte) {
-                                    self.gather(pc + 1, lo, hi, last, next);
-                                }
-                            }
-                        }
-                        if let Some(last) = last.intersection(Constraint::NotWordByte) {
-                            if last.overlaps(lo, hi) {
-                                if let Some(next) = next.intersection(Constraint::NotWordByte) {
-                                    self.gather(pc + 1, lo, hi, last, next);
-                                }
-                            }
-                        }
-                    }
-                }
+            // After matching a byte, StartText can't match; prune here.
+            Inst::Assertion(Assertions::StartText) => {}
+            // After matching a byte, StartLine can only match if it was the end of a line.
+            Inst::Assertion(Assertions::StartLine) => constrain(self, Newline, Anything),
+            // These assertions apply to the following byte, not the preceding one.
+            Inst::Assertion(Assertions::EndLine) => constrain(self, Anything, Newline),
+            Inst::Assertion(Assertions::EndText) => constrain(self, Anything, EndText),
+            // Word boundaries need the preceding byte range split into word/non-word.
+            Inst::Assertion(Assertions::AsciiWordBoundary) => {
+                constrain(self, WordByte, NotWordByte);
+                constrain(self, NotWordByte, WordByte);
+            }
+            Inst::Assertion(Assertions::AsciiNotWordBoundary) => {
+                constrain(self, WordByte, WordByte);
+                constrain(self, NotWordByte, NotWordByte);
             }
             Inst::Save(reg) => {
                 let effect = Effect::SaveTo(reg);
