@@ -1,4 +1,4 @@
-use pikevm::{compile, exec_many};
+use pikevm::compile;
 
 fn main() -> regex_syntax::Result<()> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
@@ -8,13 +8,11 @@ fn main() -> regex_syntax::Result<()> {
         .map(|pattern| compile(&pattern))
         .collect::<Result<Vec<_>, _>>()?;
     let input_bytes = input.as_bytes();
-    let results = exec_many(input_bytes, &compiled);
 
-    for program in compiled.iter() {
-        eprintln!("{}", program.to_dfa().to_dot());
-    }
-
-    for (pattern, captures) in patterns.iter().zip(results) {
+    for (pattern, program) in patterns.iter().zip(compiled) {
+        let dfa = program.to_dfa();
+        eprintln!("{}", dfa.to_dot());
+        let captures = dfa.exec(input_bytes);
         if let Some(captures) = captures {
             println!("MATCH: pattern '{}', input '{}'", pattern, input);
             for (idx, group) in captures.chunks_exact(2).enumerate() {
