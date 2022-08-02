@@ -1,4 +1,4 @@
-use bitvec::vec::BitVec;
+use flagset::{flags, FlagSet};
 use petgraph::dot;
 use petgraph::graph::{Graph, NodeIndex};
 use petgraph::visit::EdgeRef;
@@ -13,18 +13,20 @@ pub struct DFA {
     initial: Box<[Rc<Vec<usize>>]>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-enum Constraint {
-    /// any byte, or end of text
-    Anything,
-    /// [_0-9a-zA-Z]
-    WordByte,
-    /// [^_0-9a-zA-Z] or end of text
-    NotWordByte,
-    /// '\n' or end of text
-    Newline,
-    /// no byte is possible, only end of text
-    EndText,
+flags! {
+    #[derive(Hash)]
+    enum Constraint: u8 {
+        /// any byte, or end of text
+        Anything,
+        /// [_0-9a-zA-Z]
+        WordByte,
+        /// [^_0-9a-zA-Z] or end of text
+        NotWordByte,
+        /// '\n' or end of text
+        Newline,
+        /// no byte is possible, only end of text
+        EndText,
+    }
 }
 
 impl Constraint {
@@ -93,12 +95,19 @@ impl Thread {
 }
 
 fn initial_states(program: &Program) -> Vec<Thread> {
-    fn go(program: &Program, result: &mut Vec<Thread>, active: &mut BitVec, mut current: Thread) {
-        let pc = current.pc.into();
-        if active.replace(pc, true) {
+    fn go(
+        program: &Program,
+        result: &mut Vec<Thread>,
+        active: &mut Vec<FlagSet<Constraint>>,
+        mut current: Thread,
+    ) {
+        let seen = &mut active[usize::from(current.pc)];
+        if !seen.is_disjoint(current.constraint) {
             return;
         }
-        match program.buf[pc] {
+        *seen |= current.constraint;
+
+        match program.buf[usize::from(current.pc)] {
             Inst::Range(..) | Inst::Match => result.push(current),
             Inst::Assertion(kind) => {
                 let constraint = match kind {
@@ -137,7 +146,7 @@ fn initial_states(program: &Program) -> Vec<Thread> {
     }
 
     let mut result = Vec::new();
-    let mut active = BitVec::repeat(false, program.buf.len());
+    let mut active = vec![FlagSet::default(); program.buf.len()];
     let initial = Thread {
         pc: 0,
         constraint: Constraint::Anything,
@@ -161,7 +170,7 @@ impl DFA {
                     .map(|thread| thread.saved.clone())
                     .collect(),
             },
-            active: BitVec::repeat(false, program.buf.len()),
+            active: vec![FlagSet::default(); program.buf.len()],
             current_effects: Vec::new(),
             current_edges: BTreeMap::new(),
         };
@@ -318,7 +327,7 @@ struct Builder<'a> {
     states: HashMap<Box<[(u16, Constraint)]>, NodeIndex>,
     worklist: Vec<Box<[(u16, Constraint)]>>,
     dfa: DFA,
-    active: BitVec,
+    active: Vec<FlagSet<Constraint>>,
     current_effects: Vec<Effect>,
     current_edges: BTreeMap<u8, Option<State>>,
 }
@@ -336,7 +345,7 @@ impl<'a> Builder<'a> {
                 .push(Effect::CopyFrom(idx.try_into().unwrap()));
             match self.program.buf[usize::from(pc)] {
                 Inst::Range(lo, hi) => {
-                    self.active.fill(false);
+                    self.active.fill(FlagSet::default());
                     self.gather(pc + 1, lo, hi, constraint, Constraint::Anything);
                 }
                 Inst::Match => {
@@ -373,11 +382,13 @@ impl<'a> Builder<'a> {
     }
 
     fn gather(&mut self, pc: u16, lo: u8, hi: u8, last: Constraint, next: Constraint) {
-        if self.active.replace(pc as usize, true) {
+        let active = &mut self.active[usize::from(pc)];
+        if !active.is_disjoint(next) {
             return;
         }
+        *active |= next;
 
-        match self.program.buf[pc as usize] {
+        match self.program.buf[usize::from(pc)] {
             Inst::Range(..) | Inst::Match => self.add_state(lo, hi, last, Some((pc, next))),
             Inst::Assertion(kind) => {
                 match kind {
