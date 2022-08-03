@@ -1,0 +1,26 @@
+[package]
+name = "pikevm-fuzz"
+version = "0.0.0"
+authors = ["Automatically generated"]
+publish = false
+edition = "2018"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+pcre2 = "0.2.3"
+
+[dependencies.pikevm]
+path = ".."
+
+# Prevent this from interfering with workspaces
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "pcre"
+path = "fuzz_targets/pcre.rs"
+test = false
+doc = false

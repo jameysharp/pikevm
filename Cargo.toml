@@ -8,6 +8,8 @@ license = "MIT"
 [dependencies]
 bitvec = { version = "1.0.1", default-features = false, features = ["alloc"] }
 flagset = "0.4.3"
-pcre2 = "0.2.3"
 petgraph = "0.6.2"
 regex-syntax = "0.6.27"
+
+[dev-dependencies]
+pcre2 = "0.2.3"

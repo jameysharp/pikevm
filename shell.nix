@@ -25,9 +25,24 @@ let
   pkgs = import sources.nixpkgs {
     overlays = [ (import sources.rust-overlay) ];
   };
+
+  rust-nightly = pkgs.rust-bin.selectLatestNightlyWith (toolchain: toolchain.minimal);
+
+  # Some tools require a nightly build of rustc. This function wraps those with
+  # a shell script to put an appropriate version on their path.
+  with-nightly = pkg: pkgs.runCommand "${pkg.name}-nightly" {
+    nativeBuildInputs = [ pkgs.makeWrapper ];
+  } ''
+    for f in ${pkg}/bin/*; do
+      makeWrapper "$f" $out/bin/"$(basename "$f")" \
+        --prefix PATH : ${pkgs.lib.makeBinPath [ rust-nightly ]}
+    done
+  '';
+
 in pkgs.mkShell {
   nativeBuildInputs = [
     pkgs.rust-bin.stable.latest.default
+    (with-nightly pkgs.cargo-fuzz)
 
     # To update the versions of tools installed in this development
     # environment, run `niv update`.
