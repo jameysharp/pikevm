@@ -1,6 +1,8 @@
 use pikevm::compile;
 
 fn main() -> regex_syntax::Result<()> {
+    env_logger::init();
+
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     let (input, patterns) = args.split_last().unwrap();
     let compiled = patterns
@@ -11,7 +13,7 @@ fn main() -> regex_syntax::Result<()> {
 
     for (pattern, program) in patterns.iter().zip(compiled) {
         let dfa = program.to_dfa();
-        eprintln!("{}", dfa.to_dot());
+        log::info!("DFA for /{}/:\n{}", pattern, dfa.to_dot());
         let captures = dfa.exec(input_bytes);
         if let Some(captures) = captures {
             println!("MATCH: pattern '{}', input '{}'", pattern, input);

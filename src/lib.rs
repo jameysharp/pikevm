@@ -1,4 +1,5 @@
 use bitvec::vec::BitVec;
+use log::{debug, trace};
 use regex_syntax::hir::{self, Hir, HirKind};
 use regex_syntax::utf8::Utf8Sequences;
 use regex_syntax::{is_word_byte, ParserBuilder};
@@ -32,7 +33,7 @@ pub fn compile(pat: &str) -> regex_syntax::Result<Program> {
     result.push(Inst::Save(1));
     result.push(Inst::Match);
 
-    dbg!(&result);
+    debug!("Pike VM program for /{}/: {:#?}", pat, &result);
     Ok(result)
 }
 
@@ -46,7 +47,7 @@ enum Assertions {
     AsciiNotWordBoundary,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 enum Inst {
     Range(u8, u8),
     Assertion(Assertions),
@@ -56,10 +57,31 @@ enum Inst {
     Split { prefer_next: bool, to: u16 },
 }
 
-#[derive(Clone, Debug)]
+impl std::fmt::Debug for Inst {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match *self {
+            Inst::Range(lo, hi) => write!(f, "{:?}-{:?}", char::from(lo), char::from(hi)),
+            Inst::Assertion(kind) => write!(f, "assert {:?}", kind),
+            Inst::Match => write!(f, "match"),
+            Inst::Save(reg) => write!(f, "save -> register {}", reg),
+            Inst::Jmp(to) => write!(f, "jmp {}", to),
+            Inst::Split { prefer_next: true, to } => write!(f, "split next then {}", to),
+            Inst::Split { prefer_next: false, to } => write!(f, "split {} then next", to),
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct Program {
     buf: Vec<Inst>,
     registers: u16,
+}
+
+impl std::fmt::Debug for Program {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "Program ({} registers) ", self.registers)?;
+        f.debug_map().entries(self.buf.iter().enumerate()).finish()
+    }
 }
 
 impl Program {
@@ -276,7 +298,7 @@ pub fn exec_many(input: &[u8], patterns: &[impl Borrow<Program>]) -> Vec<Option<
 
     let mut last_sp = None;
     for (idx, sp) in input.iter().copied().enumerate() {
-        dbg!(idx, sp);
+        trace!("input[{}] = {:?}", idx, char::from(sp));
 
         let mut progress = false;
         for threads in patterns.iter_mut() {
@@ -342,7 +364,6 @@ impl<'a> Threads<'a> {
         }
         self.active.fill(false);
         for thread in std::mem::take(&mut self.list) {
-            dbg!(&thread, &self.program.buf[thread.pc as usize]);
             if self.add(idx, thread, prev, next) {
                 // found a Match, which supersedes any lower-priority threads
                 break;
@@ -358,6 +379,7 @@ impl<'a> Threads<'a> {
         // NFA epsilon closure: a thread can only stop on Range or Match instructions. For anything
         // else, recurse on the targets of the instruction. Note that this recursion is at worst
         // O(n) in the number of instructions; any epsilon cycles are broken using self.active.
+        trace!("eval {:?} ({:?})", &self.program.buf[thread.pc as usize], &thread);
         match self.program.buf[thread.pc as usize] {
             Inst::Range(lo, hi) => {
                 if let Some(sp) = next {
@@ -369,7 +391,7 @@ impl<'a> Threads<'a> {
             }
             Inst::Match => {
                 self.result = Some(thread.saved);
-                dbg!(&self.result);
+                trace!("match: {:?}", &self.result);
                 // unwind, discarding all lower-priority threads
                 true
             }
@@ -413,6 +435,8 @@ mod test {
 
     #[test]
     fn pathological() {
+        let _ = env_logger::try_init();
+
         let p = compile("^a*a*a*a*a*a*a*a*a*b$").unwrap();
         let input = b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaabc";
         assert_eq!(p.exec(input), None);

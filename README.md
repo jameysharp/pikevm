@@ -16,11 +16,12 @@ The code is largely uncommented; see Cox's blog posts for most of the
 explanation of what's going on. That said, there are some details that
 Cox largely handwaved which I've made explicit in this implementation,
 so I hope reading the code might also help in understanding the blog
-post.
+post. I've tried to prefer readability over performance when I had to
+choose.
 
-The implementation is pretty simple: Compiling a regex is around 170
-lines of code, and matching is about 100 lines. I've put no real effort
-into performance, just aiming for a (hopefully) readable implementation.
+If you want to see what the implementation is doing, run with
+`RUST_LOG=trace`. This should work with `cargo run`, `cargo test`, and
+`cargo fuzz`.
 
 Like the blog post, this version supports capture groups with both
 greedy and non-greedy repetition operators. I've also extended the

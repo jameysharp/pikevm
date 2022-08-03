@@ -1,4 +1,5 @@
 use flagset::{flags, FlagSet};
+use log::debug;
 use petgraph::dot;
 use petgraph::graph::{Graph, NodeIndex};
 use petgraph::visit::EdgeRef;
@@ -184,7 +185,7 @@ impl DFA {
         while let Some(active) = builder.worklist.pop() {
             builder.closure(&active);
         }
-        dbg!(builder.states);
+        debug!("DFA states: {:#?}", builder.states);
         builder.dfa
     }
 
@@ -291,7 +292,7 @@ impl DFA {
             initial.push_str("\\n");
         }
 
-        format!("digraph {{\n    0 [ xlabel=\"{initial}\" ]\n{dot:?}\n}}")
+        format!("digraph {{\n    0 [ xlabel=\"{initial}\" ]\n{dot:?}}}")
     }
 }
 

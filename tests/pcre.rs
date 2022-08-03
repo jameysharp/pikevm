@@ -100,6 +100,8 @@ fn many_empty() {
 }
 
 fn check_pcre(pattern: &str, input: &str) {
+    let _ = env_logger::try_init();
+
     let program = compile(pattern).unwrap();
     let matches = program.exec(input.as_bytes());
     let dfa = program.to_dfa();

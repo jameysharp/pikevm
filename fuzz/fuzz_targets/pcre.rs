@@ -11,6 +11,8 @@ macro_rules! fail_silently {
 }
 
 fuzz_target!(|data: (&str, &str)| {
+    let _ = env_logger::try_init();
+
     let (pattern, input) = data;
 
     // Require both PCRE and regex-syntax to accept the pattern.

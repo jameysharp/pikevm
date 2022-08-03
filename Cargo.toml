@@ -7,7 +7,9 @@ license = "MIT"
 
 [dependencies]
 bitvec = { version = "1.0.1", default-features = false, features = ["alloc"] }
+env_logger = "0.9.0"
 flagset = "0.4.3"
+log = "0.4.17"
 petgraph = "0.6.2"
 regex-syntax = "0.6.27"
 
