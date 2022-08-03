@@ -1,3 +1,4 @@
+use pcre2::bytes::Regex;
 use pikevm::compile;
 
 fn main() -> regex_syntax::Result<()> {
@@ -14,27 +15,61 @@ fn main() -> regex_syntax::Result<()> {
     for (pattern, program) in patterns.iter().zip(compiled) {
         let dfa = program.to_dfa();
         log::info!("DFA for /{}/:\n{}", pattern, dfa.to_dot());
-        let captures = dfa.exec(input_bytes);
-        if let Some(captures) = captures {
-            println!("MATCH: pattern '{}', input '{}'", pattern, input);
-            for (idx, group) in captures.chunks_exact(2).enumerate() {
-                print!(" -- {}: ", idx);
-                let start = group[0];
-                let end = group[1];
-                if start == usize::MAX {
-                    println!("no match");
-                } else {
-                    println!(
-                        "\"{}\" ({},{})",
-                        String::from_utf8_lossy(&input_bytes[start..end]),
-                        start,
-                        end
-                    );
-                }
-            }
-        } else {
-            println!("NO MATCH: pattern '{}', input '{}'", pattern, input);
-        }
+
+        println!("pattern '{}', input '{}'", pattern, input);
+
+        print!("Pike VM: ");
+        report(input, program.exec(input_bytes).map(groups));
+
+        print!("DFA: ");
+        report(input, dfa.exec(input_bytes).map(groups));
+
+        print!("PCRE: ");
+        let regex = Regex::new(pattern).unwrap();
+        let captures = regex.captures(input.as_bytes()).unwrap();
+        report(
+            input,
+            captures.map(|captures| {
+                (0..captures.len())
+                    .map(|i| captures.get(i).map(|group| (group.start(), group.end())))
+                    .collect()
+            }),
+        );
     }
     Ok(())
+}
+
+fn groups(captures: Vec<usize>) -> Vec<Option<(usize, usize)>> {
+    captures
+        .chunks_exact(2)
+        .map(|group| {
+            debug_assert_eq!(group[0] == usize::MAX, group[1] == usize::MAX);
+            if group[0] == usize::MAX {
+                None
+            } else {
+                Some((group[0], group[1]))
+            }
+        })
+        .collect()
+}
+
+fn report(input: &str, captures: Option<Vec<Option<(usize, usize)>>>) {
+    if let Some(captures) = captures {
+        println!("MATCH");
+        for (idx, group) in captures.into_iter().enumerate() {
+            print!(" -- {}: ", idx);
+            if let Some((start, end)) = group {
+                println!(
+                    "\"{}\" ({},{})",
+                    String::from_utf8_lossy(&input.as_bytes()[start..end]),
+                    start,
+                    end
+                );
+            } else {
+                println!("no match");
+            }
+        }
+    } else {
+        println!("NO MATCH");
+    }
 }
