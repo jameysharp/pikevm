@@ -70,7 +70,7 @@ impl Constraint {
             (_, Anything) => Some(self),
             (WordByte, _) | (_, WordByte) => None,
             (EndText, _) | (_, EndText) => Some(EndText),
-            (Newline, NotWordByte) | (NotWordByte, Newline) => Some(Newline),
+            (Newline, _) | (_, Newline) => Some(Newline),
             _ => unreachable!(),
         }
     }
@@ -492,5 +492,42 @@ impl<'a> Builder<'a> {
                 effects: state.effects.into_boxed_slice(),
             },
         );
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use flagset::FlagSet;
+    use std::collections::HashSet;
+
+    use super::Constraint;
+
+    /// Is `Constraint::and` consistent with `ranges` and `match_at_end`?
+    #[test]
+    fn constraint_and() {
+        // There are only a handful of constraints, so just exhaustively test all pairs.
+        for lhs in FlagSet::<Constraint>::full() {
+            for rhs in FlagSet::<Constraint>::full() {
+                let expected_end = lhs.match_at_end() && rhs.match_at_end();
+                let expected_ranges: HashSet<_> = lhs
+                    .ranges(0, 255)
+                    .flat_map(|(lo, hi)| rhs.ranges(lo, hi))
+                    .collect();
+                let (actual_end, actual_ranges) = if let Some(combined) = lhs.and(rhs) {
+                    (combined.match_at_end(), combined.ranges(0, 255).collect())
+                } else {
+                    (false, HashSet::new())
+                };
+                assert_eq!(expected_end, actual_end, "{lhs:?}.and({rhs:?})");
+                assert_eq!(expected_ranges, actual_ranges, "{lhs:?}.and({rhs:?})");
+            }
+        }
+    }
+
+    /// Does `Constraint::ranges` correctly filter the ranges to the given bounds?
+    #[test]
+    fn constraint_ranges_filter() {
+        let limited: Vec<_> = Constraint::WordByte.ranges(b'C', b'`').collect();
+        assert_eq!(limited, vec![(b'C', b'Z'), (b'_', b'_')]);
     }
 }
