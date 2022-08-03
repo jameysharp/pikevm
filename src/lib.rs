@@ -65,8 +65,13 @@ impl std::fmt::Debug for Inst {
             Inst::Match => write!(f, "match"),
             Inst::Save(reg) => write!(f, "save -> register {}", reg),
             Inst::Jmp(to) => write!(f, "jmp {}", to),
-            Inst::Split { prefer_next: true, to } => write!(f, "split next then {}", to),
-            Inst::Split { prefer_next: false, to } => write!(f, "split {} then next", to),
+            Inst::Split { prefer_next, to } => {
+                if prefer_next {
+                    write!(f, "split next then {}", to)
+                } else {
+                    write!(f, "split {} then next", to)
+                }
+            }
         }
     }
 }
@@ -379,7 +384,11 @@ impl<'a> Threads<'a> {
         // NFA epsilon closure: a thread can only stop on Range or Match instructions. For anything
         // else, recurse on the targets of the instruction. Note that this recursion is at worst
         // O(n) in the number of instructions; any epsilon cycles are broken using self.active.
-        trace!("eval {:?} ({:?})", &self.program.buf[thread.pc as usize], &thread);
+        trace!(
+            "eval {:?} ({:?})",
+            &self.program.buf[thread.pc as usize],
+            &thread
+        );
         match self.program.buf[thread.pc as usize] {
             Inst::Range(lo, hi) => {
                 if let Some(sp) = next {
