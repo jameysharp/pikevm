@@ -211,6 +211,7 @@ dependencies = [
  "env_logger",
  "flagset",
  "log",
+ "pcre2",
  "petgraph",
  "regex-syntax",
 ]

@@ -1,6 +1,6 @@
 use bitvec::vec::BitVec;
 use log::{debug, trace};
-use regex_syntax::hir::{self, Hir, HirKind};
+use regex_syntax::hir::{self, Hir};
 use regex_syntax::utf8::Utf8Sequences;
 use regex_syntax::{is_word_byte, ParserBuilder};
 use std::borrow::Borrow;
@@ -8,31 +8,51 @@ use std::rc::Rc;
 
 pub mod dfa;
 
-pub fn compile(pat: &str) -> regex_syntax::Result<Program> {
-    let mut result = Program {
-        buf: Vec::new(),
-        registers: 2,
-    };
+#[derive(Clone, Debug)]
+pub enum Error {
+    Syntax(regex_syntax::Error),
+    Compile(CompileError),
+}
 
+impl From<regex_syntax::Error> for Error {
+    fn from(e: regex_syntax::Error) -> Error {
+        Error::Syntax(e)
+    }
+}
+
+impl From<CompileError> for Error {
+    fn from(e: CompileError) -> Error {
+        Error::Compile(e)
+    }
+}
+
+pub fn compile(pat: &str) -> Result<Program, Error> {
     let mut parse_config = ParserBuilder::new();
     parse_config.allow_invalid_utf8(true);
     parse_config.unicode(false);
 
-    let hir = parse_config.build().parse(pat)?;
+    let mut hir = parse_config.build().parse(pat)?;
 
+    // Wrap capture group 0 around the whole pattern.
+    hir = Hir::group(hir::Group {
+        kind: hir::GroupKind::CaptureIndex(0),
+        hir: Box::new(hir),
+    });
+
+    // If the pattern is not (always) anchored at the start, insert a non-greedy match to skip
+    // anything at the beginning that doesn't match the pattern.
     if !hir.is_anchored_start() {
-        result.compile_hir(&Hir::repetition(hir::Repetition {
-            kind: hir::RepetitionKind::ZeroOrMore,
-            greedy: false,
-            hir: Box::new(Hir::any(true)),
-        }));
+        hir = Hir::concat(vec![
+            Hir::repetition(hir::Repetition {
+                kind: hir::RepetitionKind::ZeroOrMore,
+                greedy: false,
+                hir: Box::new(Hir::any(true)),
+            }),
+            hir,
+        ]);
     }
 
-    result.push(Inst::Save(0));
-    result.compile_hir(&hir);
-    result.push(Inst::Save(1));
-    result.push(Inst::Match);
-
+    let result = hir::visit(&hir, Compiler::default())?;
     debug!("Pike VM program for /{}/: {:#?}", pat, &result);
     Ok(result)
 }
@@ -78,7 +98,7 @@ impl std::fmt::Debug for Inst {
 
 #[derive(Clone)]
 pub struct Program {
-    buf: Vec<Inst>,
+    buf: Box<[Inst]>,
     registers: u16,
 }
 
@@ -90,22 +110,121 @@ impl std::fmt::Debug for Program {
 }
 
 impl Program {
+    pub fn exec(&self, input: &[u8]) -> Option<Vec<usize>> {
+        exec_many(input, &[self]).into_iter().next().unwrap()
+    }
+
+    pub fn to_dfa(&self) -> dfa::DFA {
+        dfa::DFA::new(self)
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct Compiler {
+    buf: Vec<Inst>,
+    registers: u16,
+    in_nullable_rep: BitVec,
+    captures: Vec<Vec<u16>>,
+    labels: Vec<u16>,
+    alternations: Vec<AlternationState>,
+}
+
+impl Compiler {
     fn loc(&self) -> u16 {
         self.buf.len() as u16
     }
 
-    fn push(&mut self, inst: Inst) -> u16 {
-        let loc = self.loc();
+    fn push(&mut self, inst: Inst) {
         self.buf.push(inst);
-        loc
     }
 
     fn placeholder(&mut self) -> u16 {
-        self.push(Inst::Jmp(u16::MAX))
+        let loc = self.loc();
+        self.push(Inst::Jmp(u16::MAX));
+        loc
     }
 
     fn patch(&mut self, loc: u16, inst: Inst) {
         self.buf[loc as usize] = inst;
+    }
+
+    /// Are we in a repetition of a subexpression which can match the empty string? If so, PCRE
+    /// reports any capture groups in this subexpression as matching after the end of the
+    /// repetition, as if the repetition ran one extra time at the end.
+    fn in_nullable_rep(&self) -> bool {
+        *self.in_nullable_rep.last().as_deref().unwrap_or(&false)
+    }
+
+    fn repetition(&mut self, rep: &hir::Repetition, end: bool) -> Result<(), CompileError> {
+        match rep.kind {
+            hir::RepetitionKind::ZeroOrOne => {
+                if !end {
+                    let split = self.placeholder();
+                    self.labels.push(split);
+                } else {
+                    let split = self.labels.pop().unwrap();
+                    let to = self.loc();
+                    let prefer_next = rep.greedy;
+                    self.patch(split, Inst::Split { prefer_next, to });
+                }
+            }
+            hir::RepetitionKind::ZeroOrMore => {
+                if !end {
+                    let split = self.placeholder();
+                    self.labels.push(split);
+                } else {
+                    let split = self.labels.pop().unwrap();
+                    self.push(Inst::Jmp(split));
+                    let to = self.loc();
+                    let prefer_next = rep.greedy;
+                    self.patch(split, Inst::Split { prefer_next, to });
+                }
+            }
+            hir::RepetitionKind::OneOrMore => {
+                if !end {
+                    let to = self.loc();
+                    self.labels.push(to);
+                } else {
+                    let to = self.labels.pop().unwrap();
+                    let prefer_next = !rep.greedy;
+                    self.push(Inst::Split { prefer_next, to });
+                }
+            }
+            hir::RepetitionKind::Range(_) => return Err(CompileError),
+        }
+
+        if !end {
+            if rep.hir.is_match_empty() && !self.in_nullable_rep() {
+                self.captures.push(Vec::new());
+            }
+            self.in_nullable_rep.push(rep.hir.is_match_empty());
+        } else {
+            self.in_nullable_rep.pop().unwrap();
+            if rep.hir.is_match_empty() && !self.in_nullable_rep() {
+                let deferred = self.captures.pop().unwrap();
+                self.buf.extend(deferred.into_iter().map(Inst::Save));
+            }
+        }
+        Ok(())
+    }
+
+    fn save(&mut self, group: &hir::GroupKind, end: bool) {
+        match group {
+            hir::GroupKind::CaptureIndex(index) | hir::GroupKind::CaptureName { index, .. } => {
+                let mut register = (index * 2).try_into().unwrap();
+                if !end {
+                    self.registers = register + 2;
+                } else {
+                    register += 1;
+                }
+                if self.in_nullable_rep() {
+                    self.captures.last_mut().unwrap().push(register);
+                } else {
+                    self.push(Inst::Save(register));
+                }
+            }
+            hir::GroupKind::NonCapturing => {}
+        }
     }
 
     fn alts<T, F: FnMut(&mut Self, T)>(&mut self, alts: impl IntoIterator<Item = T>, mut f: F) {
@@ -127,20 +246,26 @@ impl Program {
             self.patch(jmp, Inst::Jmp(to));
         }
     }
+}
 
-    fn compile_hir(&mut self, hir: &Hir) {
+#[derive(Clone, Debug)]
+pub struct CompileError;
+
+impl hir::Visitor for Compiler {
+    type Output = Program;
+    type Err = CompileError;
+
+    fn visit_pre(&mut self, hir: &Hir) -> Result<(), CompileError> {
+        use hir::HirKind::*;
         match hir.kind() {
-            HirKind::Empty => {}
-            HirKind::Literal(hir::Literal::Unicode(u)) => {
-                let mut buf = [0; 4];
-                for b in u.encode_utf8(&mut buf).bytes() {
-                    self.push(Inst::Range(b, b));
-                }
-            }
-            &HirKind::Literal(hir::Literal::Byte(b)) => {
-                self.push(Inst::Range(b, b));
-            }
-            HirKind::Class(hir::Class::Unicode(uc)) => {
+            Empty => {}
+            Literal(hir::Literal::Unicode(u)) => self.buf.extend(
+                u.encode_utf8(&mut [0; 4])
+                    .bytes()
+                    .map(|b| Inst::Range(b, b)),
+            ),
+            &Literal(hir::Literal::Byte(b)) => self.push(Inst::Range(b, b)),
+            Class(hir::Class::Unicode(uc)) => {
                 let seqs = uc
                     .iter()
                     .flat_map(|range| Utf8Sequences::new(range.start(), range.end()));
@@ -150,110 +275,124 @@ impl Program {
                     }
                 });
             }
-            HirKind::Class(hir::Class::Bytes(bc)) => self.alts(bc.iter(), |p, range| {
+            Class(hir::Class::Bytes(bc)) => self.alts(bc.iter(), |p, range| {
                 p.push(Inst::Range(range.start(), range.end()));
             }),
-            HirKind::Anchor(kind) => {
-                self.push(Inst::Assertion(match kind {
-                    hir::Anchor::StartLine => Assertions::StartLine,
-                    hir::Anchor::EndLine => Assertions::EndLine,
-                    hir::Anchor::StartText => Assertions::StartText,
-                    hir::Anchor::EndText => Assertions::EndText,
-                }));
+            Anchor(kind) => self.push(Inst::Assertion(match kind {
+                hir::Anchor::StartLine => Assertions::StartLine,
+                hir::Anchor::EndLine => Assertions::EndLine,
+                hir::Anchor::StartText => Assertions::StartText,
+                hir::Anchor::EndText => Assertions::EndText,
+            })),
+            WordBoundary(kind) => self.push(Inst::Assertion(match kind {
+                hir::WordBoundary::Ascii => Assertions::AsciiWordBoundary,
+                hir::WordBoundary::AsciiNegate => Assertions::AsciiNotWordBoundary,
+                _ => return Err(CompileError),
+            })),
+            Repetition(rep) => self.repetition(rep, false)?,
+            Group(group) => self.save(&group.kind, false),
+            Concat(_) => {}
+            Alternation(subs) => {
+                let mut state = AlternationState::begin(self, subs);
+                state.begin_alternative(self);
+                self.alternations.push(state);
             }
-            HirKind::WordBoundary(kind) => {
-                self.push(Inst::Assertion(match kind {
-                    hir::WordBoundary::Ascii => Assertions::AsciiWordBoundary,
-                    hir::WordBoundary::AsciiNegate => Assertions::AsciiNotWordBoundary,
-                    _ => unimplemented!(),
-                }));
-            }
-            HirKind::Repetition(rep) => {
-                match rep.kind {
-                    hir::RepetitionKind::ZeroOrOne => {
-                        let split = self.placeholder();
-                        self.compile_hir(&rep.hir);
-                        let to = self.loc();
-                        let prefer_next = rep.greedy;
-                        self.patch(split, Inst::Split { prefer_next, to });
-                    }
-                    hir::RepetitionKind::ZeroOrMore => {
-                        let split = self.placeholder();
-                        self.compile_hir(&rep.hir);
-                        self.push(Inst::Jmp(split));
-                        let to = self.loc();
-                        let prefer_next = rep.greedy;
-                        self.patch(split, Inst::Split { prefer_next, to });
-                    }
-                    hir::RepetitionKind::OneOrMore => {
-                        let to = self.loc();
-                        self.compile_hir(&rep.hir);
-                        let prefer_next = !rep.greedy;
-                        self.push(Inst::Split { prefer_next, to });
-                    }
-                    hir::RepetitionKind::Range(_) => unimplemented!(),
-                }
-                if rep.hir.is_match_empty() {
-                    self.nullable_captures(&rep.hir);
-                }
-            }
-            HirKind::Group(group) => match group.kind {
-                hir::GroupKind::CaptureIndex(index) | hir::GroupKind::CaptureName { index, .. } => {
-                    let register = (index * 2) as _;
-                    self.registers = register + 2;
-                    self.push(Inst::Save(register));
-                    self.compile_hir(&group.hir);
-                    self.push(Inst::Save(register + 1));
-                }
-                hir::GroupKind::NonCapturing => self.compile_hir(&group.hir),
-            },
-            HirKind::Concat(subs) => subs.iter().for_each(|hir| self.compile_hir(hir)),
-            HirKind::Alternation(subs) => self.alts(subs, Self::compile_hir),
         }
+        Ok(())
     }
 
-    /// Fix up match positions to match PCRE's weird behavior on repetitions of subexpressions
-    /// which can match the empty string. Any nested groups that would capture when the whole
-    /// subexpression is given the empty string should always capture after the repetition ends.
-    fn nullable_captures(&mut self, hir: &Hir) {
-        debug_assert!(hir.is_match_empty());
+    fn visit_post(&mut self, hir: &Hir) -> Result<(), CompileError> {
+        use hir::HirKind::*;
         match hir.kind() {
-            HirKind::Empty => {}
-            HirKind::Literal(_) => {}
-            HirKind::Class(_) => {}
-            HirKind::Anchor(_) => {}
-            HirKind::WordBoundary(_) => {}
-            HirKind::Repetition(rep) => {
-                if rep.hir.is_match_empty() {
-                    self.nullable_captures(&rep.hir);
-                }
+            // Non-recursive cases are handled above in visit_pre.
+            Empty | Literal(_) | Class(_) | Anchor(_) | WordBoundary(_) => {}
+            Repetition(rep) => self.repetition(rep, true)?,
+            Group(group) => self.save(&group.kind, true),
+            Concat(_) => {}
+            Alternation(_) => {
+                let mut state = self.alternations.pop().unwrap();
+                state.end_alternative(self);
+                state.end(self);
             }
-            HirKind::Group(group) => {
-                self.nullable_captures(&group.hir);
-                match group.kind {
-                    hir::GroupKind::CaptureIndex(index)
-                    | hir::GroupKind::CaptureName { index, .. } => {
-                        let register = (index * 2) as _;
-                        self.push(Inst::Save(register));
-                        self.push(Inst::Save(register + 1));
-                    }
-                    hir::GroupKind::NonCapturing => {}
-                }
-            }
-            HirKind::Concat(subs) => subs.iter().for_each(|hir| self.nullable_captures(hir)),
-            HirKind::Alternation(subs) => {
-                let first_empty = subs.iter().find(|hir| hir.is_match_empty()).unwrap();
-                self.nullable_captures(first_empty);
-            }
+        }
+        Ok(())
+    }
+
+    fn visit_alternation_in(&mut self) -> Result<(), CompileError> {
+        let mut state = self.alternations.pop().unwrap();
+        state.end_alternative(self);
+        state.begin_alternative(self);
+        self.alternations.push(state);
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<Program, CompileError> {
+        debug_assert!(self.in_nullable_rep.is_empty());
+        debug_assert!(self.captures.is_empty());
+        debug_assert!(self.labels.is_empty());
+        debug_assert!(self.alternations.is_empty());
+        self.push(Inst::Match);
+        Ok(Program {
+            buf: self.buf.into_boxed_slice(),
+            registers: self.registers,
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+struct AlternationState {
+    remaining: usize,
+    first_nullable: usize,
+    jmps: Vec<u16>,
+}
+
+impl AlternationState {
+    fn begin(compiler: &Compiler, subs: &Vec<Hir>) -> AlternationState {
+        let mut state = AlternationState {
+            remaining: subs.len(),
+            first_nullable: 0,
+            jmps: Vec::with_capacity(subs.len() - 1),
+        };
+        if compiler.in_nullable_rep() {
+            // We're inside a nullable subexpression, so some alternative is nullable.
+            let i = subs.iter().position(|sub| sub.is_match_empty()).unwrap();
+            state.first_nullable = i + 1;
+        }
+        state
+    }
+
+    fn begin_alternative(&mut self, compiler: &mut Compiler) {
+        compiler.in_nullable_rep.push(self.first_nullable == 1);
+        if self.first_nullable > 0 {
+            self.first_nullable -= 1;
+        }
+
+        if self.remaining > 1 {
+            let split = compiler.placeholder();
+            compiler.labels.push(split);
         }
     }
 
-    pub fn exec(&self, input: &[u8]) -> Option<Vec<usize>> {
-        exec_many(input, &[self]).into_iter().next().unwrap()
+    fn end_alternative(&mut self, compiler: &mut Compiler) {
+        if self.remaining > 1 {
+            let split = compiler.labels.pop().unwrap();
+            self.jmps.push(compiler.placeholder());
+            let to = compiler.loc();
+            let prefer_next = true; // prefer left-most successful alternative
+            compiler.patch(split, Inst::Split { prefer_next, to });
+        }
+        self.remaining -= 1;
+
+        compiler.in_nullable_rep.pop().unwrap();
     }
 
-    pub fn to_dfa(&self) -> dfa::DFA {
-        dfa::DFA::new(self)
+    fn end(self, compiler: &mut Compiler) {
+        debug_assert_eq!(self.remaining, 0);
+        debug_assert_eq!(self.first_nullable, 0);
+        let to = compiler.loc();
+        for jmp in self.jmps {
+            compiler.patch(jmp, Inst::Jmp(to));
+        }
     }
 }
 

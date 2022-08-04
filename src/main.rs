@@ -1,7 +1,7 @@
 use pcre2::bytes::Regex;
 use pikevm::compile;
 
-fn main() -> regex_syntax::Result<()> {
+fn main() -> Result<(), pikevm::Error> {
     env_logger::init();
 
     let args = std::env::args().skip(1).collect::<Vec<_>>();
