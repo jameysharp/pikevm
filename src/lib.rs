@@ -1,6 +1,6 @@
 use bitvec::vec::BitVec;
 use log::{debug, trace};
-use regex_syntax::hir::{self, Hir};
+use regex_syntax::hir::{self, Hir, Visitor};
 use regex_syntax::utf8::Utf8Sequences;
 use regex_syntax::{is_word_byte, ParserBuilder};
 use std::borrow::Borrow;
@@ -123,8 +123,6 @@ impl Program {
 struct Compiler {
     buf: Vec<Inst>,
     registers: u16,
-    in_nullable_rep: BitVec,
-    captures: Vec<Vec<u16>>,
     labels: Vec<u16>,
     alternations: Vec<AlternationState>,
 }
@@ -146,13 +144,6 @@ impl Compiler {
 
     fn patch(&mut self, loc: u16, inst: Inst) {
         self.buf[loc as usize] = inst;
-    }
-
-    /// Are we in a repetition of a subexpression which can match the empty string? If so, PCRE
-    /// reports any capture groups in this subexpression as matching after the end of the
-    /// repetition, as if the repetition ran one extra time at the end.
-    fn in_nullable_rep(&self) -> bool {
-        *self.in_nullable_rep.last().as_deref().unwrap_or(&false)
     }
 
     fn repetition(&mut self, rep: &hir::Repetition, end: bool) -> Result<(), CompileError> {
@@ -197,37 +188,57 @@ impl Compiler {
             }
             hir::RepetitionKind::Range(_) => return Err(CompileError),
         }
+        Ok(())
+    }
 
-        let nullable_rep = rep.greedy && rep.hir.is_match_empty();
-        if !end {
-            if nullable_rep && !self.in_nullable_rep() {
-                self.captures.push(Vec::new());
-            }
-            self.in_nullable_rep.push(nullable_rep);
+    fn nullable_rep_post(&mut self, hir: &Hir) -> Result<(), CompileError> {
+        use hir::HirKind::*;
+        if !hir.is_match_empty() {
+            return Ok(());
+        }
+
+        let hir = if let Alternation(subs) = hir.kind() {
+            std::borrow::Cow::Owned(Hir::alternation(
+                subs.iter()
+                    .filter(|sub| sub.is_match_empty())
+                    .cloned()
+                    .collect(),
+            ))
         } else {
-            self.in_nullable_rep.pop().unwrap();
-            if nullable_rep && !self.in_nullable_rep() {
-                let deferred = self.captures.pop().unwrap();
-                self.buf.extend(deferred.into_iter().map(Inst::Save));
+            std::borrow::Cow::Borrowed(hir)
+        };
+
+        self.visit_pre(&hir)?;
+        match hir.kind() {
+            // no nested subexpressions
+            Empty | Literal(_) | Class(_) | Anchor(_) | WordBoundary(_) => {}
+            Repetition(rep) => self.nullable_rep_post(&rep.hir)?,
+            Group(group) => self.nullable_rep_post(&group.hir)?,
+            Concat(subs) => {
+                for sub in subs.iter() {
+                    self.nullable_rep_post(sub)?;
+                }
+            }
+            Alternation(subs) => {
+                self.nullable_rep_post(&subs[0])?;
+                for sub in &subs[1..] {
+                    self.visit_alternation_in()?;
+                    self.nullable_rep_post(sub)?;
+                }
             }
         }
-        Ok(())
+        self.visit_post(&hir)
     }
 
     fn save(&mut self, group: &hir::GroupKind, end: bool) {
         match group {
             hir::GroupKind::CaptureIndex(index) | hir::GroupKind::CaptureName { index, .. } => {
                 let mut register = (index * 2).try_into().unwrap();
-                if !end {
-                    self.registers = register + 2;
-                } else {
+                self.registers = self.registers.max(register + 2);
+                if end {
                     register += 1;
                 }
-                if self.in_nullable_rep() {
-                    self.captures.last_mut().unwrap().push(register);
-                } else {
-                    self.push(Inst::Save(register));
-                }
+                self.push(Inst::Save(register));
             }
             hir::GroupKind::NonCapturing => {}
         }
@@ -257,7 +268,7 @@ impl Compiler {
 #[derive(Clone, Debug)]
 pub struct CompileError;
 
-impl hir::Visitor for Compiler {
+impl Visitor for Compiler {
     type Output = Program;
     type Err = CompileError;
 
@@ -302,7 +313,7 @@ impl hir::Visitor for Compiler {
             Group(group) => self.save(&group.kind, false),
             Concat(_) => {}
             Alternation(subs) => {
-                let mut state = AlternationState::begin(self, subs);
+                let mut state = AlternationState::begin(subs);
                 state.begin_alternative(self);
                 self.alternations.push(state);
             }
@@ -315,7 +326,23 @@ impl hir::Visitor for Compiler {
         match hir.kind() {
             // Non-recursive cases are handled above in visit_pre.
             Empty | Literal(_) | Class(_) | Anchor(_) | WordBoundary(_) => {}
-            Repetition(rep) => self.repetition(rep, true)?,
+            Repetition(rep) => {
+                self.repetition(rep, true)?;
+
+                // Are we in a repetition of a subexpression which can match the empty string? If
+                // so, PCRE reports any capture groups in this subexpression as matching after the
+                // end of the repetition, as if the repetition ran one extra time at the end.
+                if rep.greedy && rep.hir.is_match_empty() {
+                    let again = hir::Repetition {
+                        kind: hir::RepetitionKind::ZeroOrOne,
+                        greedy: true,
+                        hir: Box::new(Hir::empty()),
+                    };
+                    self.repetition(&again, false)?;
+                    self.nullable_rep_post(&rep.hir)?;
+                    self.repetition(&again, true)?;
+                }
+            }
             Group(group) => self.save(&group.kind, true),
             Concat(_) => {}
             Alternation(_) => {
@@ -336,8 +363,6 @@ impl hir::Visitor for Compiler {
     }
 
     fn finish(mut self) -> Result<Program, CompileError> {
-        debug_assert!(self.in_nullable_rep.is_empty());
-        debug_assert!(self.captures.is_empty());
         debug_assert!(self.labels.is_empty());
         debug_assert!(self.alternations.is_empty());
         self.push(Inst::Match);
@@ -351,31 +376,18 @@ impl hir::Visitor for Compiler {
 #[derive(Clone, Debug)]
 struct AlternationState {
     remaining: usize,
-    first_nullable: usize,
     jmps: Vec<u16>,
 }
 
 impl AlternationState {
-    fn begin(compiler: &Compiler, subs: &Vec<Hir>) -> AlternationState {
-        let mut state = AlternationState {
+    fn begin(subs: &Vec<Hir>) -> AlternationState {
+        AlternationState {
             remaining: subs.len(),
-            first_nullable: 0,
             jmps: Vec::with_capacity(subs.len() - 1),
-        };
-        if compiler.in_nullable_rep() {
-            // We're inside a nullable subexpression, so some alternative is nullable.
-            let i = subs.iter().position(|sub| sub.is_match_empty()).unwrap();
-            state.first_nullable = i + 1;
         }
-        state
     }
 
     fn begin_alternative(&mut self, compiler: &mut Compiler) {
-        compiler.in_nullable_rep.push(self.first_nullable == 1);
-        if self.first_nullable > 0 {
-            self.first_nullable -= 1;
-        }
-
         if self.remaining > 1 {
             let split = compiler.placeholder();
             compiler.labels.push(split);
@@ -391,13 +403,10 @@ impl AlternationState {
             compiler.patch(split, Inst::Split { prefer_next, to });
         }
         self.remaining -= 1;
-
-        compiler.in_nullable_rep.pop().unwrap();
     }
 
     fn end(self, compiler: &mut Compiler) {
         debug_assert_eq!(self.remaining, 0);
-        debug_assert_eq!(self.first_nullable, 0);
         let to = compiler.loc();
         for jmp in self.jmps {
             compiler.patch(jmp, Inst::Jmp(to));

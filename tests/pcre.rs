@@ -84,6 +84,8 @@ fn nullable_captures() {
     check_pcre("^((a*)(a*)(a*))*", "aaa");
     check_pcre("((a)*(a)?a*)+", "aaa");
     check_pcre("()??", "");
+    check_pcre("($)?", "a");
+    check_pcre("($||x)*", "a");
 }
 
 #[test]
