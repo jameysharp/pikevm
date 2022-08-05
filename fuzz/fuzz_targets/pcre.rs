@@ -52,6 +52,7 @@ fuzz_target!(|data: (ast::Ast, &str)| {
 /// the same way.
 mod ast {
     use libfuzzer_sys::arbitrary::{self, Arbitrary};
+    use std::collections::BTreeSet;
 
     pub type Ast = Alternation;
 
@@ -69,6 +70,7 @@ mod ast {
         }
     }
 
+    #[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
     struct Range(Literal, Literal);
 
     impl Arbitrary<'_> for Range {
@@ -89,8 +91,13 @@ mod ast {
     #[derive(Arbitrary)]
     enum Repeatable {
         Literal(Literal),
-        DotAll,
-        Class(Box<[Range]>),
+        // Use an ordered set for character classes so a class can't both start and end with '=',
+        // which PCRE treats as a POSIX "collating element". Also because it's not that interesting
+        // to test different permutations of the same character class.
+        Class {
+            ranges: BTreeSet<Range>,
+            negated: bool,
+        },
         Group {
             sub: Box<Alternation>,
             capturing: bool,
@@ -147,14 +154,21 @@ mod ast {
             use Repeatable::*;
             match self {
                 Literal(c) => write!(f, "{}", c),
-                DotAll => f.write_str("(?s:.)"),
-                Class(ranges) => {
+                Class { ranges, negated } => {
                     if ranges.is_empty() {
                         // Rather than convincing Arbitrary to generate only non-empty classes, I'm
-                        // choosing to interpret empty classes as "anything but newline".
-                        f.write_str(".")
+                        // choosing to interpret empty classes as "anything but newline", and their
+                        // negation as "anything at all".
+                        if *negated {
+                            f.write_str("(?s:.)")
+                        } else {
+                            f.write_str(".")
+                        }
                     } else {
                         f.write_str("[")?;
+                        if *negated {
+                            f.write_str("^")?;
+                        }
                         for &Range(start, end) in ranges.iter() {
                             if start == end {
                                 write!(f, "{}", start)?;
