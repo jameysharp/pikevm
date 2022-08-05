@@ -4,10 +4,10 @@ use libfuzzer_sys::fuzz_target;
 use pcre2::bytes::Regex;
 use pikevm::compile;
 
-fuzz_target!(|data: (ast::Ast, &str)| {
+fuzz_target!(|data: (ast::Ast, ast::ASCIIString)| {
     let _ = env_logger::try_init();
 
-    let (pattern, input) = data;
+    let (pattern, ast::ASCIIString(input)) = data;
     let pattern = pattern.to_string();
 
     if pattern.chars().filter(|&c| c == '.').count() > 5 {
@@ -232,6 +232,18 @@ mod ast {
     impl std::fmt::Debug for Alternation {
         fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
             write!(f, "/{}/", self)
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    pub struct ASCIIString(pub String);
+
+    impl Arbitrary<'_> for ASCIIString {
+        fn arbitrary(u: &mut arbitrary::Unstructured) -> arbitrary::Result<Self> {
+            let input = <&[u8] as Arbitrary>::arbitrary(u)?;
+            Ok(ASCIIString(
+                input.iter().map(|b| char::from(b & 0x7F)).collect(),
+            ))
         }
     }
 }
