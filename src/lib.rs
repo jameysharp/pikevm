@@ -292,7 +292,10 @@ impl hir::Visitor for Compiler {
             WordBoundary(kind) => self.push(Inst::Assertion(match kind {
                 hir::WordBoundary::Ascii => Assertions::AsciiWordBoundary,
                 hir::WordBoundary::AsciiNegate => Assertions::AsciiNotWordBoundary,
-                _ => return Err(CompileError),
+                // FIXME: Unicode word boundaries are hard when matching byte-at-a-time. This
+                // implementation cheats by pretending you asked for ASCII boundaries instead.
+                hir::WordBoundary::Unicode => Assertions::AsciiWordBoundary,
+                hir::WordBoundary::UnicodeNegate => Assertions::AsciiNotWordBoundary,
             })),
             Repetition(rep) => self.repetition(rep, false)?,
             Group(group) => self.save(&group.kind, false),
