@@ -181,6 +181,11 @@ impl Compiler {
                 }
             }
             hir::RepetitionKind::OneOrMore => {
+                if let hir::HirKind::Repetition(_) = rep.hir.kind() {
+                    // PCRE steals syntax like '++' for "possessive" quantifiers. I don't want to
+                    // implement those, so just refuse to compile them.
+                    return Err(CompileError);
+                }
                 if !end {
                     let to = self.loc();
                     self.labels.push(to);
