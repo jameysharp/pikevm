@@ -83,6 +83,7 @@ fn nullable_captures() {
     check_pcre("(a*)+", "aaa");
     check_pcre("^((a*)(a*)(a*))*", "aaa");
     check_pcre("((a)*(a)?a*)+", "aaa");
+    check_pcre("()??", "");
 }
 
 #[test]

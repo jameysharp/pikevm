@@ -198,14 +198,15 @@ impl Compiler {
             hir::RepetitionKind::Range(_) => return Err(CompileError),
         }
 
+        let nullable_rep = rep.greedy && rep.hir.is_match_empty();
         if !end {
-            if rep.hir.is_match_empty() && !self.in_nullable_rep() {
+            if nullable_rep && !self.in_nullable_rep() {
                 self.captures.push(Vec::new());
             }
-            self.in_nullable_rep.push(rep.hir.is_match_empty());
+            self.in_nullable_rep.push(nullable_rep);
         } else {
             self.in_nullable_rep.pop().unwrap();
-            if rep.hir.is_match_empty() && !self.in_nullable_rep() {
+            if nullable_rep && !self.in_nullable_rep() {
                 let deferred = self.captures.pop().unwrap();
                 self.buf.extend(deferred.into_iter().map(Inst::Save));
             }
