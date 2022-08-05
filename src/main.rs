@@ -13,14 +13,13 @@ fn main() -> Result<(), pikevm::Error> {
     let input_bytes = input.as_bytes();
 
     for (pattern, program) in patterns.iter().zip(compiled) {
-        let dfa = program.to_dfa();
-        log::info!("DFA for /{}/:\n{}", pattern, dfa.to_dot());
-
         println!("pattern '{}', input '{}'", pattern, input);
 
         print!("Pike VM: ");
         report(input, program.exec(input_bytes).map(groups));
 
+        let dfa = program.to_dfa();
+        log::info!("DFA for /{}/:\n{}", pattern, dfa.to_dot());
         print!("DFA: ");
         report(input, dfa.exec(input_bytes).map(groups));
 
