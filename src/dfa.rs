@@ -167,7 +167,7 @@ impl DFA {
                     .map(|thread| thread.saved.clone())
                     .collect(),
             },
-            active: vec![FlagSet::default(); program.buf.len()],
+            active: vec![(FlagSet::default(), FlagSet::default()); program.buf.len()],
             current_effects: Vec::new(),
             current_edges: BTreeMap::new(),
         };
@@ -324,7 +324,7 @@ struct Builder<'a> {
     states: HashMap<Box<[(u16, Constraint)]>, NodeIndex>,
     worklist: Vec<Box<[(u16, Constraint)]>>,
     dfa: DFA,
-    active: Vec<FlagSet<Constraint>>,
+    active: Vec<(FlagSet<Constraint>, FlagSet<Constraint>)>,
     current_effects: Vec<Effect>,
     current_edges: BTreeMap<u8, Option<State>>,
 }
@@ -342,7 +342,7 @@ impl<'a> Builder<'a> {
                 .push(Effect::CopyFrom(idx.try_into().unwrap()));
             match self.program.buf[usize::from(pc)] {
                 Inst::Range(lo, hi) => {
-                    self.active.fill(FlagSet::default());
+                    self.active.fill((FlagSet::default(), FlagSet::default()));
                     self.gather(pc + 1, lo, hi, constraint, Constraint::Anything);
                 }
                 Inst::Match => {
@@ -381,10 +381,11 @@ impl<'a> Builder<'a> {
     fn gather(&mut self, pc: u16, lo: u8, hi: u8, last: Constraint, next: Constraint) {
         use Constraint::*;
         let active = &mut self.active[usize::from(pc)];
-        if !active.is_disjoint(next) {
+        if !active.0.is_disjoint(last) && !active.1.is_disjoint(next) {
             return;
         }
-        *active |= next;
+        active.0 |= last;
+        active.1 |= next;
 
         let constrain =
             |this: &mut Self, new_last, new_next| match (last.and(new_last), next.and(new_next)) {
