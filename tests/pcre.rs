@@ -106,11 +106,6 @@ fn many_empty() {
 fn check_pcre(pattern: &str, input: &str) {
     let _ = env_logger::try_init();
 
-    let program = compile(pattern).unwrap();
-    let matches = program.exec(input.as_bytes());
-    let dfa = program.to_dfa();
-    let dfa_matches = dfa.exec(input.as_bytes());
-
     let regex = Regex::new(pattern).unwrap();
     let captures = regex.captures(input.as_bytes()).unwrap();
     let expected = captures.map(|captures| {
@@ -122,15 +117,31 @@ fn check_pcre(pattern: &str, input: &str) {
             .collect()
     });
 
+    let program = compile(pattern).unwrap();
+    let matches = program.exec(input.as_bytes());
+
     assert_eq!(
         matches, expected,
         "wrong captures for /{pattern}/ on '{input}'",
     );
+
+    let dfa = program.to_dfa();
+    let dfa_matches = dfa.exec(input.as_bytes());
 
     assert_eq!(
         dfa_matches,
         expected,
         "wrong captures for DFA of /{pattern}/ on '{input}':\n{}",
         dfa.to_dot(),
+    );
+
+    let cfg = pikevm::dfa::cfg::CFG::from(&dfa);
+    let cfg_matches = cfg.exec(input.as_bytes());
+
+    assert_eq!(
+        cfg_matches,
+        expected,
+        "wrong captures for CFG of /{pattern}/ on '{input}':\n{:#?}",
+        cfg.to_dot(),
     );
 }

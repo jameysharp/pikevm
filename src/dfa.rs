@@ -8,6 +8,8 @@ use std::rc::Rc;
 
 use super::{Assertions, Inst, Program};
 
+pub mod cfg;
+
 #[derive(Clone, Debug)]
 pub struct DFA {
     graph: Graph<Node, Edge>,

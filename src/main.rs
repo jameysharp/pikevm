@@ -23,6 +23,11 @@ fn main() -> Result<(), pikevm::Error> {
         print!("DFA: ");
         report(input, dfa.exec(input_bytes).map(groups));
 
+        let cfg = pikevm::dfa::cfg::CFG::from(&dfa);
+        log::info!("CFG for /{}/:\n{:?}", pattern, cfg.to_dot());
+        print!("CFG: ");
+        report(input, cfg.exec(input_bytes).map(groups));
+
         print!("PCRE: ");
         let regex = Regex::new(pattern).unwrap();
         let captures = regex.captures(input.as_bytes()).unwrap();
